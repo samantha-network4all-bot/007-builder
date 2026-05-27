@@ -40,6 +40,7 @@ type Config struct {
 	LLMTools    string // llm.tools
 	LLMModel    string // llm.model ("openrouter/owl-alpha", etc.)
 	LLMThinking string // llm.thinking ("off"|"minimal"|"low"|"medium"|"high"|"xhigh")
+	LLMCaveman  bool   // llm.caveman — terse-mode directive prepended to all prompts
 
 	// Loop.
 	AttemptsPerIssue   int    // loop.attempts_per_issue
@@ -187,6 +188,8 @@ func set(c *Config, section, key, value string) {
 		c.LLMModel = value
 	case "llm.thinking":
 		c.LLMThinking = value
+	case "llm.caveman":
+		c.LLMCaveman = value == "true" || value == "1" || value == "yes"
 	case "loop.attempts_per_issue":
 		fmt.Sscanf(value, "%d", &c.AttemptsPerIssue)
 	case "loop.hitl_label":

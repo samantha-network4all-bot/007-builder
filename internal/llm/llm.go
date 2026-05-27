@@ -12,6 +12,19 @@ import (
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
 )
 
+// cavemanPrefix is prepended to UserMessage when Invocation.Caveman is
+// set. The phrasing is intentionally blunt — owl-alpha and similar
+// chat-tuned models will otherwise default to "Let me analyze…"
+// preambles that scroll for minutes before doing anything.
+const cavemanPrefix = `CAVEMAN MODE.
+Rules:
+- No preamble. No "Let me…", "I'll…", "Looking at…", "Based on…".
+- No restating the task. No summaries before acting.
+- No thinking-out-loud. If you must think, think silently.
+- Tool calls and final answer only. Status updates are at most one short line.
+- Final answer = the smallest possible artifact (JSON, commit, etc.). No commentary.
+- If you start writing prose, stop and emit a tool call instead.`
+
 // Outcome categorises an agent invocation.
 type Outcome int
 
@@ -52,6 +65,12 @@ type Invocation struct {
 	Thinking         string // --thinking level
 	WorkingDir       string // cwd of subprocess
 	TrackCommit      bool   // record HEAD before/after; if unchanged on exit 0 → Noop
+
+	// Caveman, when true, prepends a terseness directive to UserMessage
+	// so the model produces minimum prose. Useful when the agent's
+	// "let me analyze the current state by looking at..." monologues
+	// burn tokens and elapsed time without adding signal.
+	Caveman bool
 
 	// Stream, when non-nil, switches Run to live stdout pumping. Each
 	// stdout line is fed to Stream.Handle as it arrives — useful when
@@ -104,7 +123,11 @@ func Run(inv Invocation) (Result, error) {
 	if inv.Thinking != "" {
 		args = append(args, "--thinking", inv.Thinking)
 	}
-	args = append(args, inv.UserMessage)
+	userMsg := inv.UserMessage
+	if inv.Caveman {
+		userMsg = cavemanPrefix + "\n\n" + userMsg
+	}
+	args = append(args, userMsg)
 
 	res := Result{CommandLine: cli + " " + strings.Join(args, " ")}
 

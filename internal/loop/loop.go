@@ -181,6 +181,7 @@ func Work(args []string) error {
 	cfgPath := fs.String("config", "", "path to .agent/config.yaml")
 	issueOverride := fs.Int("issue", 0, "force a specific issue number")
 	dryRun := fs.Bool("dry-run", false, "render the prompt; do not invoke the LLM")
+	caveman := fs.Bool("caveman", false, "terse mode: prepend a 'no monologues' directive to the prompt")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -278,6 +279,7 @@ func Work(args []string) error {
 		Tools:       cfg.LLMTools,
 		WorkingDir:  cwd,
 		TrackCommit: true,
+		Caveman:     *caveman || cfg.LLMCaveman,
 		Stream:      sink,
 	}
 	res, err := llm.Run(inv)
@@ -369,8 +371,13 @@ func Work(args []string) error {
 func Run(args []string) error {
 	fs := flag.NewFlagSet("loop", flag.ContinueOnError)
 	maxIter := fs.Int("max", 0, "max iterations (0 = unlimited)")
+	caveman := fs.Bool("caveman", false, "terse mode: prepend a 'no monologues' directive to every agent call")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	var inner []string
+	if *caveman {
+		inner = []string{"--caveman"}
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -399,14 +406,14 @@ func Run(args []string) error {
 		}
 		if open == nil {
 			ui.Note("no open slice — asking planner for a new one")
-			if err := plan.NextIssue(nil); err != nil {
+			if err := plan.NextIssue(inner); err != nil {
 				return fmt.Errorf("iter %d: next-issue: %w", i, err)
 			}
 		} else {
 			ui.Note("continuing on open issue #%d", open.Number)
 		}
 
-		if err := Work(nil); err != nil {
+		if err := Work(inner); err != nil {
 			ui.Fail("iter %d: work returned: %v", i, err)
 			// continue — failed iterations bump attempt; loop will pick it back up.
 		}

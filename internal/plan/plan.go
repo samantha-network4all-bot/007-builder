@@ -40,6 +40,7 @@ func NextIssue(args []string) error {
 	fs := flag.NewFlagSet("next-issue", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "print the proposed issue without opening it")
 	configPath := fs.String("config", "", "path to .agent/config.yaml")
+	caveman := fs.Bool("caveman", false, "terse mode: prepend a 'no monologues' directive to the prompt")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -104,6 +105,7 @@ func NextIssue(args []string) error {
 		UserMessage:      "Choose the next slice. Output strict JSON only — no surrounding prose, no markdown fences.",
 		Tools:            "read,grep,find,ls",
 		WorkingDir:       cwd,
+		Caveman:          *caveman || cfg.LLMCaveman,
 		Stream:           sink,
 	}
 	res, err := llm.Run(inv)
