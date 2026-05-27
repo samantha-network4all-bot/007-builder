@@ -56,19 +56,13 @@ type EventSink struct {
 	assistantText strings.Builder
 	charsOut      int64
 	startedAt     time.Time
-	lastTick      atomic.Int64 // unix nanos of the last on-screen status update
-
-	// In-place status state.
-	mu          sync.Mutex
-	statusShown bool   // is there a \r-line currently parked at the cursor?
-	tailBuf     []byte // sliding window of the last assistant-text characters, for the preview
-	currentTool string // tool name currently in flight (shown in status line)
-	tty         bool
+	mu           sync.Mutex
+	inTextStream bool   // are we currently mid-paragraph of dim model text?
+	currentTool  string // last tool that was started, for log context
+	tty          bool
 
 	verbose bool
 }
-
-const tailWindow = 70 // characters of assistant text to show in the status preview
 
 // NewEventSink prepares a fresh sink. When verbose=true, every pi event
 // produces a line; otherwise only interesting events do.
@@ -78,7 +72,6 @@ func NewEventSink(verbose bool) *EventSink {
 		startedAt: time.Now(),
 		tty:       isTTY(),
 	}
-	s.lastTick.Store(time.Now().UnixNano())
 	return s
 }
 
@@ -91,38 +84,37 @@ func isTTY() bool {
 }
 
 // Handle processes one stdout line from pi.
+//
+// Design: stream the model's text deltas directly to stdout in dim
+// color so the user can read along. Tool calls pop out as bright
+// permanent events above the dim stream. There is no in-place status
+// counter — the visible text *is* the proof of life. A summary line
+// prints at agent_end with chars/elapsed/rate.
 func (s *EventSink) Handle(line string) {
 	if !strings.HasPrefix(line, "{") {
-		if s.verbose {
-			s.permanent(func() { ui.Note("%s", trim(line, 200)) })
-		}
 		return
 	}
 	var ev piEvent
 	if err := json.Unmarshal([]byte(line), &ev); err != nil {
-		if s.verbose {
-			s.permanent(func() { ui.Note("non-event: %s", trim(line, 200)) })
-		}
 		return
 	}
 
 	switch ev.Type {
 	case "session":
-		s.permanent(func() { ui.Note("session opened") })
+		s.eventLine(func() { ui.Note("session opened") })
 	case "agent_start":
-		s.permanent(func() { ui.Step("agent starting") })
+		s.eventLine(func() { ui.Step("agent starting") })
 	case "message_update":
 		switch ev.AssistantMessageEvent.Type {
 		case "text_delta":
 			delta := ev.AssistantMessageEvent.Delta
 			s.assistantText.WriteString(delta)
 			atomic.AddInt64(&s.charsOut, int64(len(delta)))
-			s.appendTail(delta)
-			s.maybeTick()
+			s.streamText(delta)
 		case "text_start":
-			// quiet — beginning a new text run; the status line will reflect it
+			// nothing — the delta itself is the cue
 		case "text_end":
-			// quiet
+			// keep the cursor at end-of-line; next text run will resume
 		}
 		if ev.ToolUseEvent.Type != "" {
 			s.handleToolUse(ev.ToolUseEvent.Type, ev.ToolUseEvent.ToolName, ev.ToolUseEvent.ToolInput)
@@ -133,70 +125,45 @@ func (s *EventSink) Handle(line string) {
 		s.handleToolUse("end", ev.ToolUseEvent.ToolName, nil)
 	case "tool_result_end":
 		if ev.ToolResultEvent.IsError {
-			s.permanent(func() { ui.Fail("tool error: %s", ev.ToolResultEvent.ToolName) })
+			s.eventLine(func() { ui.Fail("tool error: %s", ev.ToolResultEvent.ToolName) })
 		}
 	case "agent_end":
-		s.permanent(func() {
-			ui.OK("agent done · %s out · %s",
-				humanChars(atomic.LoadInt64(&s.charsOut)),
-				humanDur(time.Since(s.startedAt)))
+		s.eventLine(func() {
+			elapsed := time.Since(s.startedAt)
+			c := atomic.LoadInt64(&s.charsOut)
+			ui.OK("agent done · %s · %s · %s", humanChars(c), humanDur(elapsed), humanRate(c, elapsed))
 		})
 	default:
-		if s.verbose {
-			s.permanent(func() { ui.Note("event: %s", ev.Type) })
-		}
+		// silent — too noisy
 	}
 }
 
-// permanent prints a persistent log line. On a TTY it first clears the
-// in-place status line, then runs the print, then re-shows the status
-// so the cursor lands back on a clean status row.
-func (s *EventSink) permanent(print func()) {
+// streamText writes a model-text delta directly to stdout in dim color,
+// finishing whatever line is in flight. Newlines are preserved so the
+// model's paragraph structure shows through.
+func (s *EventSink) streamText(delta string) {
 	s.mu.Lock()
-	if s.tty && s.statusShown {
-		fmt.Print("\r\033[K")
-		s.statusShown = false
+	defer s.mu.Unlock()
+	if !s.inTextStream {
+		// Start of a new text run — drop a newline + dim escape so the
+		// stream visually sits below the last bright event line.
+		fmt.Print("\033[2m")
+		s.inTextStream = true
+	}
+	fmt.Print(delta)
+}
+
+// eventLine ends the current dim text stream (if any) and prints a
+// permanent event line via ui. Subsequent text deltas restart the dim
+// stream.
+func (s *EventSink) eventLine(print func()) {
+	s.mu.Lock()
+	if s.inTextStream {
+		fmt.Print("\033[0m\n")
+		s.inTextStream = false
 	}
 	s.mu.Unlock()
 	print()
-	// On TTY, re-arm the status line immediately so the next tick
-	// repaints in place (rather than appending after the print).
-	s.maybeTickForce()
-}
-
-func (s *EventSink) appendTail(delta string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, b := range []byte(delta) {
-		// Treat newlines/tabs as spaces so the preview stays on one line.
-		if b == '\n' || b == '\r' || b == '\t' {
-			b = ' '
-		}
-		s.tailBuf = append(s.tailBuf, b)
-	}
-	if len(s.tailBuf) > tailWindow {
-		s.tailBuf = s.tailBuf[len(s.tailBuf)-tailWindow:]
-	}
-}
-
-func (s *EventSink) renderStatus() string {
-	chars := atomic.LoadInt64(&s.charsOut)
-	elapsed := time.Since(s.startedAt)
-	rate := humanRate(chars, elapsed)
-
-	s.mu.Lock()
-	tool := s.currentTool
-	tail := string(s.tailBuf)
-	s.mu.Unlock()
-
-	main := fmt.Sprintf("≈ %s · %s · %s", humanChars(chars), humanDur(elapsed), rate)
-	if tool != "" {
-		return main + " · tool: " + tool
-	}
-	if strings.TrimSpace(tail) != "" {
-		return main + " · " + tail
-	}
-	return main + " · thinking…"
 }
 
 // AssistantText returns the assembled assistant text after the run
@@ -204,14 +171,14 @@ func (s *EventSink) renderStatus() string {
 // (e.g. the planner, which expects JSON).
 func (s *EventSink) AssistantText() string { return s.assistantText.String() }
 
-// Finish clears the in-place status line so subsequent log output starts
-// on a clean row. Idempotent; safe to call multiple times.
+// Finish closes any open dim text stream so subsequent log output
+// starts on a clean row with the default color. Idempotent.
 func (s *EventSink) Finish() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tty && s.statusShown {
-		fmt.Print("\r\033[K")
-		s.statusShown = false
+	if s.inTextStream {
+		fmt.Print("\033[0m\n")
+		s.inTextStream = false
 	}
 }
 
@@ -229,7 +196,7 @@ func (s *EventSink) handleToolUse(kind, name string, input json.RawMessage) {
 		s.mu.Lock()
 		s.currentTool = display
 		s.mu.Unlock()
-		s.permanent(func() { ui.Step("tool: %s", display) })
+		s.eventLine(func() { ui.Step("tool: %s", display) })
 	case "end":
 		s.mu.Lock()
 		s.currentTool = ""
@@ -270,44 +237,6 @@ func toolSummary(name string, input json.RawMessage) string {
 		}
 	}
 	return trim(string(input), 60)
-}
-
-// maybeTick refreshes the in-place status line at most every 250ms.
-// On TTY it uses \r + clear-to-end so the line is overwritten in place;
-// on a pipe it falls back to one-line-per-tick, but throttled.
-func (s *EventSink) maybeTick() {
-	const minInterval = 250 * time.Millisecond
-	now := time.Now().UnixNano()
-	last := s.lastTick.Load()
-	if time.Duration(now-last) < minInterval {
-		return
-	}
-	if !s.lastTick.CompareAndSwap(last, now) {
-		return
-	}
-	s.paintStatus()
-}
-
-// maybeTickForce updates the status line right after a permanent event,
-// without honoring the rate limit, so the screen always shows a status
-// row after a tool-call print.
-func (s *EventSink) maybeTickForce() {
-	s.lastTick.Store(time.Now().UnixNano())
-	s.paintStatus()
-}
-
-func (s *EventSink) paintStatus() {
-	line := s.renderStatus()
-	if s.tty {
-		fmt.Printf("\r\033[K\033[2m%s\033[0m", line)
-		s.mu.Lock()
-		s.statusShown = true
-		s.mu.Unlock()
-	} else {
-		// Non-TTY: one row per tick, throttled to 250ms (above) so logs
-		// stay readable when piped.
-		fmt.Println(line)
-	}
 }
 
 func trim(s string, n int) string {
