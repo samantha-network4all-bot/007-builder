@@ -308,29 +308,33 @@ func Work(args []string) error {
 	// Code agent committed something. Run feature check.
 	featureErr := runFeatureCheck(cwd, cfg, acceptance, issue.Number, attempt)
 
-	// Screenshot is captured by the feature check regardless of pass/fail.
-	// Commit and embed it in the issue comment so progress is visible
-	// on github.com without leaving the issue page.
-	shotPath := readScreenshotPath(cwd, cfg)
+	// Build the per-attempt comment. Screenshot is best-effort — if it's
+	// missing (e.g. the app doesn't expose /screenshot yet) we still
+	// post the textual outcome so the issue page reflects progress.
 	verdict := "pass"
 	summary := "feature check green"
 	if featureErr != nil {
 		verdict = "fail"
 		summary = truncate(featureErr.Error(), 2000)
 	}
+
+	shotPath := readScreenshotPath(cwd, cfg)
+	imageLine := "_(no screenshot — `/screenshot` endpoint not yet implemented)_"
 	if shotPath != "" {
 		if err := commitAndPushScreenshot(cwd, shotPath, issue.Number, attempt, verdict); err != nil {
 			ui.Warn("screenshot commit: %v", err)
+			imageLine = "_(screenshot captured but push failed: " + err.Error() + ")_"
 		} else {
 			rawURL := github.RepoRawURL(cfg.ProjectRepo, "main", shotPath)
-			body := fmt.Sprintf("## Attempt %d — %s\n\n![Slate after attempt %d](%s)\n\n%s",
-				attempt, verdict, attempt, rawURL, summary)
-			if err := github.CommentIssue(issue.Number, body); err != nil {
-				ui.Warn("comment issue: %v", err)
-			} else {
-				ui.OK("posted screenshot comment to #%d", issue.Number)
-			}
+			imageLine = fmt.Sprintf("![Slate after attempt %d](%s)", attempt, rawURL)
 		}
+	}
+	body := fmt.Sprintf("## Attempt %d — %s\n\n%s\n\n%s",
+		attempt, verdict, imageLine, summary)
+	if err := github.CommentIssue(issue.Number, body); err != nil {
+		ui.Warn("comment issue: %v", err)
+	} else {
+		ui.OK("posted attempt %d outcome to #%d", attempt, issue.Number)
 	}
 
 	if featureErr != nil {
@@ -362,6 +366,15 @@ func Run(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(cwd)
+	if err != nil {
+		return err
+	}
+
 	i := 0
 	for {
 		if *maxIter > 0 && i >= *maxIter {
@@ -370,9 +383,23 @@ func Run(args []string) error {
 		}
 		i++
 		ui.Header("iter %d", i)
-		if err := plan.NextIssue(nil); err != nil {
-			return fmt.Errorf("iter %d: next-issue: %w", i, err)
+
+		// Only open a new issue when nothing's open. Otherwise keep
+		// hammering the current oldest open slice until it closes or
+		// hits the attempt cap.
+		open, err := github.OldestOpenSlice(cfg.SliceLabel)
+		if err != nil {
+			return fmt.Errorf("iter %d: list open slices: %w", i, err)
 		}
+		if open == nil {
+			ui.Note("no open slice — asking planner for a new one")
+			if err := plan.NextIssue(nil); err != nil {
+				return fmt.Errorf("iter %d: next-issue: %w", i, err)
+			}
+		} else {
+			ui.Note("continuing on open issue #%d", open.Number)
+		}
+
 		if err := Work(nil); err != nil {
 			ui.Fail("iter %d: work returned: %v", i, err)
 			// continue — failed iterations bump attempt; loop will pick it back up.
