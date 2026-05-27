@@ -1,0 +1,13 @@
+# Compiled binary (root-level only — do NOT match cmd/builder/)
+/builder
+*.test
+
+# Coverage
+*.out
+
+# OS
+.DS_Store
+
+# Local dev
+.idea/
+.vscode/
