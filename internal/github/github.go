@@ -127,19 +127,128 @@ func CreateIssue(title, body string, labels []string) (int, error) {
 	return n, nil
 }
 
-// BumpAttemptLabel removes attempt:N and adds attempt:N+1, returning the
-// new attempt number. If no attempt label is set, starts at 1.
-//
-// TODO(007-builder): implement via two `gh issue edit --remove-label
-// / --add-label` calls. Deferred until loop.Work needs it.
-func BumpAttemptLabel(issue int, prefix string) (int, error) {
-	return 0, fmt.Errorf("TODO: BumpAttemptLabel not yet implemented")
+// GetIssue fetches one issue with its labels + body.
+func GetIssue(num int) (*Issue, error) {
+	r, err := sh.MustRun("", "gh", "issue", "view", fmt.Sprintf("%d", num),
+		"--json", "number,title,body,state,labels")
+	if err != nil {
+		return nil, err
+	}
+	var i Issue
+	if err := json.Unmarshal([]byte(r.Stdout), &i); err != nil {
+		return nil, fmt.Errorf("decode gh issue view: %w", err)
+	}
+	return &i, nil
 }
 
-// HandoffForReview opens a PR with `awaiting-human-review` and closes
-// the underlying issue (per the HITL pattern in lessons §2).
-//
-// TODO(007-builder): implement. Deferred until loop.Work needs it.
-func HandoffForReview(issue int, branch, hitlLabel string) error {
-	return fmt.Errorf("TODO: HandoffForReview not yet implemented")
+// CurrentAttempt extracts N from any `<prefix>N` label on the issue.
+// Returns 0 if none is set.
+func (i Issue) CurrentAttempt(prefix string) int {
+	for _, l := range i.Labels {
+		if strings.HasPrefix(l.Name, prefix) {
+			var n int
+			if _, err := fmt.Sscanf(l.Name[len(prefix):], "%d", &n); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// SetAttemptLabel removes any existing attempt:N label and applies the
+// new one. Creates the label on the repo first if it doesn't exist.
+func SetAttemptLabel(num int, prefix string, n int) error {
+	current, err := GetIssue(num)
+	if err != nil {
+		return err
+	}
+	// Remove existing attempt:* labels.
+	for _, l := range current.Labels {
+		if strings.HasPrefix(l.Name, prefix) {
+			if _, err := sh.Run("", "gh", "issue", "edit", fmt.Sprintf("%d", num),
+				"--remove-label", l.Name); err != nil {
+				return err
+			}
+		}
+	}
+	newLabel := fmt.Sprintf("%s%d", prefix, n)
+	// Create the label if missing (idempotent — ignore "already exists").
+	_, _ = sh.Run("", "gh", "label", "create", newLabel, "--description", "attempt counter", "--color", "ededed")
+	r, err := sh.Run("", "gh", "issue", "edit", fmt.Sprintf("%d", num), "--add-label", newLabel)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("gh issue edit --add-label %s: %s", newLabel, r.Combined())
+	}
+	return nil
+}
+
+// CloseIssue closes the issue with an optional comment.
+func CloseIssue(num int, comment string) error {
+	args := []string{"issue", "close", fmt.Sprintf("%d", num)}
+	if comment != "" {
+		args = append(args, "--comment", comment)
+	}
+	r, err := sh.MustRun("", "gh", args...)
+	if err != nil {
+		return err
+	}
+	_ = r
+	return nil
+}
+
+// CommentIssue posts a comment on an open issue. Used when an attempt
+// fails to attach the failure context for the next code agent.
+func CommentIssue(num int, body string) error {
+	_, err := sh.MustRun("", "gh", "issue", "comment", fmt.Sprintf("%d", num), "--body", body)
+	return err
+}
+
+// OldestOpenSlice returns the oldest open slice-labelled issue, or
+// (nil, nil) if there are none.
+func OldestOpenSlice(label string) (*Issue, error) {
+	if label == "" {
+		label = "slice"
+	}
+	r, err := sh.MustRun("", "gh", "issue", "list",
+		"--label", label,
+		"--state", "open",
+		"--json", "number,title,body,state,labels",
+		"--limit", "200",
+	)
+	if err != nil {
+		return nil, err
+	}
+	var issues []Issue
+	if err := json.Unmarshal([]byte(r.Stdout), &issues); err != nil {
+		return nil, fmt.Errorf("decode gh issue list: %w", err)
+	}
+	if len(issues) == 0 {
+		return nil, nil
+	}
+	// gh sorts newest-first; the oldest is the last entry. (Numbers are
+	// monotonic per repo, so picking the smallest number is also correct.)
+	oldest := &issues[0]
+	for i := range issues {
+		if issues[i].Number < oldest.Number {
+			oldest = &issues[i]
+		}
+	}
+	return oldest, nil
+}
+
+// HandoffForReview is the human-review escalation called at attempt cap.
+// Adds the HITL label, comments with a pointer to the latest failure,
+// and leaves the issue open for a human.
+func HandoffForReview(issue int, hitlLabel, reason string) error {
+	// Create the label idempotently.
+	_, _ = sh.Run("", "gh", "label", "create", hitlLabel,
+		"--description", "needs human review",
+		"--color", "d73a4a")
+	if _, err := sh.Run("", "gh", "issue", "edit", fmt.Sprintf("%d", issue), "--add-label", hitlLabel); err != nil {
+		return err
+	}
+	body := fmt.Sprintf("Hit attempt cap — escalating for human review.\n\nLast failure:\n```\n%s\n```", reason)
+	return CommentIssue(issue, body)
 }

@@ -1,40 +1,193 @@
 // Package llm shells out to the pi (preferred) or claude CLI to invoke
-// an LLM. It distinguishes the four exit categories enumerated in
+// an LLM. It distinguishes the five exit categories enumerated in
 // lessons §2.6 so the orchestrator can take the right next action.
 package llm
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
 
-// Outcome categorises an agent invocation. The orchestrator uses these to
-// decide whether to retry, escalate to HITL, or accept the result.
+	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+)
+
+// Outcome categorises an agent invocation.
 type Outcome int
 
 const (
-	OutcomeUnknown Outcome = iota
-	OutcomeSucceeded
-	OutcomeNoop       // CLI exited 0 but HEAD didn't move
-	OutcomeBadOutput  // CLI exited 0 but produced invalid JSON / broken patch
-	OutcomeRefused    // CLI exited non-zero with a "I cannot help with that" body
-	OutcomeUnreachable // network / upstream error reaching the model
+	OutcomeUnknown     Outcome = iota
+	OutcomeSucceeded            // CLI exited 0 and (for code agents) HEAD moved
+	OutcomeNoop                 // CLI exited 0 but HEAD did not move
+	OutcomeBadOutput            // CLI exited 0 but downstream parsing failed
+	OutcomeRefused              // CLI exited non-zero with a polite refusal in the body
+	OutcomeUnreachable          // network / upstream error reaching the model
 )
+
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeSucceeded:
+		return "succeeded"
+	case OutcomeNoop:
+		return "noop"
+	case OutcomeBadOutput:
+		return "bad-output"
+	case OutcomeRefused:
+		return "refused"
+	case OutcomeUnreachable:
+		return "unreachable"
+	default:
+		return "unknown"
+	}
+}
 
 // Invocation describes one agent run.
 type Invocation struct {
-	PromptPath string            // path to the rendered prompt template
-	Mode       string            // "code", "review", "plan"
-	Env        map[string]string // extra env (e.g. ANTHROPIC_API_KEY)
-	WorkingDir string            // chdir before invocation
+	CLI              string // "pi" (default) or "claude"
+	Mode             string // "json" or "text" (--mode)
+	SystemPromptFile string // appended via --append-system-prompt
+	UserMessage      string // first user-role message
+	Tools            string // --tools allowlist (comma-separated)
+	Model            string // --model "<provider>/<id>"
+	Thinking         string // --thinking level
+	WorkingDir       string // cwd of subprocess
+	TrackCommit      bool   // record HEAD before/after; if unchanged on exit 0 → Noop
 }
 
-// Run invokes pi (or claude as a fallback) and returns a categorised outcome
-// plus the agent's last stdout (for log forwarding).
-//
-// TODO(slate-v2): implement. Sketch:
-//   1. git rev-parse HEAD before.
-//   2. `pi --print --no-session --mode json --append-system-prompt @PROMPT --tools read,bash,edit,write,grep,find,ls`.
-//   3. Inspect stderr for "Connection error" / "Unauthorized" → Unreachable.
-//   4. git rev-parse HEAD after — equal? → Noop.
-//   5. Otherwise Succeeded.
-func Run(inv Invocation) (Outcome, string, error) {
-	return OutcomeUnknown, "", fmt.Errorf("TODO: llm.Run not yet implemented")
+// Result is what Run returns alongside the categorised outcome.
+type Result struct {
+	Outcome     Outcome
+	Stdout      string
+	Stderr      string
+	ExitCode    int
+	HEADBefore  string
+	HEADAfter   string
+	CommandLine string
+}
+
+// Run invokes pi (or claude) with the given inputs and returns a
+// categorised outcome. The contract is "the process ran with a
+// recognisable exit category, or we return an error" — callers should
+// branch on Outcome, not ExitCode.
+func Run(inv Invocation) (Result, error) {
+	cli := inv.CLI
+	if cli == "" {
+		cli = "pi"
+	}
+
+	headBefore := ""
+	if inv.TrackCommit {
+		if r, err := sh.Run(inv.WorkingDir, "git", "rev-parse", "HEAD"); err == nil && r.ExitCode == 0 {
+			headBefore = strings.TrimSpace(r.Stdout)
+		}
+	}
+
+	args := []string{"--print", "--no-session"}
+	if inv.Mode != "" {
+		args = append(args, "--mode", inv.Mode)
+	}
+	if inv.SystemPromptFile != "" {
+		args = append(args, "--append-system-prompt", inv.SystemPromptFile)
+	}
+	if inv.Tools != "" {
+		args = append(args, "--tools", inv.Tools)
+	}
+	if inv.Model != "" {
+		args = append(args, "--model", inv.Model)
+	}
+	if inv.Thinking != "" {
+		args = append(args, "--thinking", inv.Thinking)
+	}
+	args = append(args, inv.UserMessage)
+
+	res := Result{CommandLine: cli + " " + strings.Join(args, " ")}
+
+	r, err := sh.Run(inv.WorkingDir, cli, args...)
+	if err != nil {
+		res.Outcome = OutcomeUnknown
+		return res, err
+	}
+	res.Stdout = r.Stdout
+	res.Stderr = r.Stderr
+	res.ExitCode = r.ExitCode
+	res.HEADBefore = headBefore
+
+	switch {
+	case unreachable(r):
+		res.Outcome = OutcomeUnreachable
+	case refused(r):
+		res.Outcome = OutcomeRefused
+	case r.ExitCode != 0:
+		res.Outcome = OutcomeBadOutput
+	default:
+		if inv.TrackCommit {
+			if after, ok := readHEAD(inv.WorkingDir); ok {
+				res.HEADAfter = after
+				if after == headBefore {
+					res.Outcome = OutcomeNoop
+				} else {
+					res.Outcome = OutcomeSucceeded
+				}
+			} else {
+				res.Outcome = OutcomeNoop
+			}
+		} else {
+			res.Outcome = OutcomeSucceeded
+		}
+	}
+	return res, nil
+}
+
+func readHEAD(dir string) (string, bool) {
+	r, err := sh.Run(dir, "git", "rev-parse", "HEAD")
+	if err != nil || r.ExitCode != 0 {
+		return "", false
+	}
+	return strings.TrimSpace(r.Stdout), true
+}
+
+func unreachable(r sh.Result) bool {
+	if r.ExitCode == 0 {
+		return false
+	}
+	needles := []string{
+		"connection error", "connection refused", "timed out", "timeout",
+		"unauthorized", "401 ", "503 ", "bad gateway", "network is unreachable",
+	}
+	hay := strings.ToLower(r.Stderr + " " + r.Stdout)
+	for _, n := range needles {
+		if strings.Contains(hay, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func refused(r sh.Result) bool {
+	if r.ExitCode == 0 {
+		return false
+	}
+	needles := []string{
+		"i cannot help", "i can't help", "i won't", "i refuse", "policy",
+	}
+	hay := strings.ToLower(r.Stdout)
+	for _, n := range needles {
+		if strings.Contains(hay, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// MustFile resolves a prompt path and verifies it exists, returning an
+// absolute path. Used by callers passing SystemPromptFile.
+func MustFile(path string) (string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("prompt file %s: %w", path, err)
+	}
+	if st.IsDir() {
+		return "", errors.New("prompt path is a directory: " + path)
+	}
+	return path, nil
 }
