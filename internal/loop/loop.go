@@ -281,6 +281,7 @@ func Work(args []string) error {
 		Stream:      sink,
 	}
 	res, err := llm.Run(inv)
+	sink.Finish()
 	if err != nil {
 		return fmt.Errorf("invoke code agent: %w", err)
 	}
