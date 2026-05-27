@@ -17,6 +17,7 @@ import (
 	"github.com/samantha-network4all-bot/007-builder/internal/plan"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
 	"github.com/samantha-network4all-bot/007-builder/internal/state"
+	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
 // Bootstrap is a one-shot setup:
@@ -56,7 +57,10 @@ func Bootstrap(args []string) error {
 		return err
 	}
 
-	fmt.Printf("bootstrap: project=%s repo=%s cwd=%s\n", cfg.ProjectName, cfg.ProjectRepo, cwd)
+	ui.Header("bootstrap")
+	ui.KV("project", cfg.ProjectName)
+	ui.KV("repo", cfg.ProjectRepo)
+	ui.KV("cwd", cwd)
 
 	if *dryRun {
 		fmt.Println("would: gh auth status")
@@ -79,9 +83,9 @@ func Bootstrap(args []string) error {
 		if err := github.CreateRepo(cfg.ProjectRepo, desc); err != nil {
 			return err
 		}
-		fmt.Printf("created repo: https://github.com/%s\n", cfg.ProjectRepo)
+		ui.OK("created repo https://github.com/%s", cfg.ProjectRepo)
 	} else {
-		fmt.Printf("repo already exists: https://github.com/%s\n", cfg.ProjectRepo)
+		ui.Note("repo already exists: https://github.com/%s", cfg.ProjectRepo)
 	}
 
 	if err := ensureLocalGit(cwd, cfg.ProjectRepo); err != nil {
@@ -92,7 +96,7 @@ func Bootstrap(args []string) error {
 		return err
 	}
 
-	fmt.Println("bootstrap complete.")
+	ui.OK("bootstrap complete")
 	return nil
 }
 
@@ -148,9 +152,9 @@ func initialCommitAndPush(dir, projectName string) error {
 		if _, err := sh.MustRun(dir, "git", "commit", "-m", msg); err != nil {
 			return err
 		}
-		fmt.Println("created seed commit.")
+		ui.OK("created seed commit")
 	} else {
-		fmt.Println("working tree clean — nothing new to commit.")
+		ui.Note("working tree clean — nothing new to commit")
 	}
 
 	push, err := sh.Run(dir, "git", "push", "-u", "origin", "main")
@@ -160,7 +164,7 @@ func initialCommitAndPush(dir, projectName string) error {
 	if push.ExitCode != 0 {
 		return fmt.Errorf("git push failed:\n%s", push.Combined())
 	}
-	fmt.Println("pushed to origin/main.")
+	ui.OK("pushed to origin/main")
 	return nil
 }
 
@@ -214,17 +218,18 @@ func Work(args []string) error {
 			return err
 		}
 		if issue == nil {
-			fmt.Println("no open slice issues — nothing to do.")
+			ui.Note("no open slice issues — nothing to do")
 			return nil
 		}
 	}
 
 	attempt := issue.CurrentAttempt(cfg.AttemptLabelPrefix)
-	fmt.Printf("work: issue #%d %q (attempt %d/%d)\n",
-		issue.Number, issue.Title, attempt, cfg.AttemptsPerIssue)
+	ui.Header("work")
+	ui.Issue(issue.Number, issue.Title)
+	ui.KV("attempt", fmt.Sprintf("%d / %d", attempt, cfg.AttemptsPerIssue))
 
 	if attempt >= cfg.AttemptsPerIssue {
-		fmt.Println("attempt cap already reached — escalating for HITL.")
+		ui.Warn("attempt cap already reached — escalating for HITL")
 		return github.HandoffForReview(issue.Number, cfg.HITLLabel,
 			"attempt cap reached before this run started")
 	}
@@ -250,11 +255,12 @@ func Work(args []string) error {
 	defer os.Remove(tmpPrompt)
 
 	if *dryRun {
-		fmt.Println("=== rendered code prompt ===")
+		ui.Header("rendered code prompt")
 		fmt.Println(rendered)
 		return nil
 	}
 
+	ui.Step("invoking code agent (%s %s)", cfg.LLMCLI, cfg.LLMModel)
 	// Invoke the code agent.
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
@@ -272,8 +278,8 @@ func Work(args []string) error {
 	if err != nil {
 		return fmt.Errorf("invoke code agent: %w", err)
 	}
-	fmt.Printf("code agent outcome: %s (exit=%d, HEAD %s → %s)\n",
-		res.Outcome, res.ExitCode, abbrev(res.HEADBefore), abbrev(res.HEADAfter))
+	ui.Outcome(res.Outcome.String(),
+		fmt.Sprintf("(exit=%d, HEAD %s → %s)", res.ExitCode, abbrev(res.HEADBefore), abbrev(res.HEADAfter)))
 
 	// Persist state.
 	st := &state.State{
@@ -317,7 +323,7 @@ func Work(args []string) error {
 		fmt.Sprintf("Closed by 007-builder. Commit %s passed the feature check.", abbrev(res.HEADAfter))); err != nil {
 		return err
 	}
-	fmt.Printf("closed issue #%d.\n", issue.Number)
+	ui.OK("closed issue #%d", issue.Number)
 	return nil
 }
 
@@ -334,17 +340,16 @@ func Run(args []string) error {
 	i := 0
 	for {
 		if *maxIter > 0 && i >= *maxIter {
-			fmt.Printf("loop: reached --max %d, stopping.\n", *maxIter)
+			ui.Note("reached --max %d, stopping", *maxIter)
 			return nil
 		}
 		i++
-		fmt.Printf("\n=== iter %d: next-issue ===\n", i)
+		ui.Header("iter %d", i)
 		if err := plan.NextIssue(nil); err != nil {
 			return fmt.Errorf("iter %d: next-issue: %w", i, err)
 		}
-		fmt.Printf("\n=== iter %d: work ===\n", i)
 		if err := Work(nil); err != nil {
-			fmt.Printf("iter %d: work returned: %v\n", i, err)
+			ui.Fail("iter %d: work returned: %v", i, err)
 			// continue — failed iterations bump attempt; loop will pick it back up.
 		}
 	}

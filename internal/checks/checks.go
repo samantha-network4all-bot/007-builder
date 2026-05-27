@@ -17,6 +17,7 @@ import (
 
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
 // Dispatch routes `builder check <sub> ...` to the right handler.
@@ -103,6 +104,8 @@ func Feature(args []string) error {
 		return err
 	}
 
+	ui.Header("feature check")
+	ui.Step("build (%d step%s)", len(cfg.FeatureBuild), plural(len(cfg.FeatureBuild)))
 	// 1. Build.
 	buildLog, err := runBuild(cwd, cfg.FeatureBuild)
 	writeBuildLog(cwd, cfg, buildLog)
@@ -144,6 +147,7 @@ func Feature(args []string) error {
 		return fmt.Errorf("port file %s did not appear: %v\nstderr:\n%s", cfg.FeaturePortFile, err, truncate(stderr.String(), 2000))
 	}
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	ui.OK("app up on %s", baseURL)
 
 	if err := waitForHealthz(baseURL+pathOr(cfg.FeatureHealthzEndpoint, "/healthz"), 5*time.Second); err != nil {
 		return fmt.Errorf("/healthz never went green: %v\nstderr:\n%s", err, truncate(stderr.String(), 2000))
@@ -179,9 +183,9 @@ func Feature(args []string) error {
 				ResponseTo: c.Method + " " + c.Path,
 			})
 			if ok {
-				fmt.Printf("✓ %s %s\n", c.Method, c.Path)
+				ui.OK("%s %s", c.Method, c.Path)
 			} else {
-				fmt.Printf("✗ %s %s — %s\n", c.Method, c.Path, detail)
+				ui.Fail("%s %s — %s", c.Method, c.Path, detail)
 				allOK = false
 			}
 		}
@@ -198,7 +202,7 @@ func Feature(args []string) error {
 	if !report.Pass {
 		return fmt.Errorf("feature check failed")
 	}
-	fmt.Println("feature check: PASS")
+	ui.OK("feature check: PASS")
 	return nil
 }
 
@@ -382,6 +386,13 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // Quality runs the code-quality agent (read-only pi invocation) against

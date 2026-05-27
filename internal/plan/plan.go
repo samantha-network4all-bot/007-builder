@@ -15,6 +15,7 @@ import (
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
 // LLMResponse is the JSON shape the planner expects from the LLM.
@@ -58,6 +59,7 @@ func NextIssue(args []string) error {
 	if err := cfg.Validate("project.repo", "paths.prd", "paths.prompts"); err != nil {
 		return err
 	}
+	ui.Step("planner: asking %s for the next slice", cfg.LLMModel)
 
 	prdPath := absInProject(cwd, cfg.PRDPath)
 	prdBytes, err := os.ReadFile(prdPath)
@@ -115,7 +117,7 @@ func NextIssue(args []string) error {
 	}
 
 	if resp.Done {
-		fmt.Printf("planner: done — %s\n", resp.Reason)
+		ui.OK("planner: PRD covered — %s", resp.Reason)
 		return nil
 	}
 	if resp.Title == "" || resp.Body == "" {
@@ -128,10 +130,10 @@ func NextIssue(args []string) error {
 	}
 
 	if *dryRun {
-		fmt.Println("=== proposed issue ===")
-		fmt.Println("title:", resp.Title)
-		fmt.Println("labels:", strings.Join(labels, ","))
-		fmt.Println("body:")
+		ui.Header("proposed issue (dry run)")
+		ui.KV("title", resp.Title)
+		ui.KV("labels", strings.Join(labels, ","))
+		fmt.Println()
 		fmt.Println(resp.Body)
 		return nil
 	}
@@ -140,7 +142,8 @@ func NextIssue(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create issue: %w", err)
 	}
-	fmt.Printf("opened issue #%d: %s\n", num, resp.Title)
+	ui.OK("opened issue")
+	ui.Issue(num, resp.Title)
 	return nil
 }
 
