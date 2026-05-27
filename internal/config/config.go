@@ -35,9 +35,11 @@ type Config struct {
 	StateDir     string // paths.state
 
 	// LLM CLI choice.
-	LLMCLI   string // llm.cli  ("pi" | "claude")
-	LLMMode  string // llm.mode ("json" | "text")
-	LLMTools string // llm.tools
+	LLMCLI      string // llm.cli  ("pi" | "claude")
+	LLMMode     string // llm.mode ("json" | "text")
+	LLMTools    string // llm.tools
+	LLMModel    string // llm.model ("openrouter/owl-alpha", etc.)
+	LLMThinking string // llm.thinking ("off"|"minimal"|"low"|"medium"|"high"|"xhigh")
 
 	// Loop.
 	AttemptsPerIssue   int    // loop.attempts_per_issue
@@ -181,6 +183,10 @@ func set(c *Config, section, key, value string) {
 		c.LLMMode = value
 	case "llm.tools":
 		c.LLMTools = value
+	case "llm.model":
+		c.LLMModel = value
+	case "llm.thinking":
+		c.LLMThinking = value
 	case "loop.attempts_per_issue":
 		fmt.Sscanf(value, "%d", &c.AttemptsPerIssue)
 	case "loop.hitl_label":

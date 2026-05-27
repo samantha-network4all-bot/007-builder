@@ -258,6 +258,8 @@ func Work(args []string) error {
 	// Invoke the code agent.
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
+		Model:            cfg.LLMModel,
+		Thinking:         cfg.LLMThinking,
 		Mode:             "text",
 		SystemPromptFile: tmpPrompt,
 		UserMessage: fmt.Sprintf("Implement issue #%d. Commit on main and push when done.",

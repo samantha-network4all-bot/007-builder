@@ -89,11 +89,15 @@ func NextIssue(args []string) error {
 	}
 	defer os.Remove(tmpPrompt)
 
+	// pi --mode json emits an event stream (JSONL of session/turn/message
+	// events), not a single JSON document. We use the default text mode
+	// and parse the model's prose for the embedded JSON block.
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
-		Mode:             "json",
+		Model:            cfg.LLMModel,
+		Thinking:         cfg.LLMThinking,
 		SystemPromptFile: tmpPrompt,
-		UserMessage:      "Choose the next slice. Output strict JSON only.",
+		UserMessage:      "Choose the next slice. Output strict JSON only — no surrounding prose, no markdown fences.",
 		Tools:            "read,grep,find,ls",
 		WorkingDir:       cwd,
 	}
@@ -187,44 +191,56 @@ func writeTempPrompt(s string) (string, error) {
 }
 
 // decodeLLMJSON pulls the first decodable LLMResponse out of stdout.
-// Accepts a raw object or a `{"result": "..."}` envelope (pi --mode json
-// can produce either depending on the model wrapper).
+// Handles three shapes the model might emit:
+//  1. Bare JSON object.
+//  2. Markdown ```json``` fence wrapping the object.
+//  3. JSON object preceded/followed by prose (we take the largest {…} span).
 func decodeLLMJSON(stdout string) (*LLMResponse, error) {
 	stdout = strings.TrimSpace(stdout)
 	if stdout == "" {
 		return nil, fmt.Errorf("empty stdout")
 	}
 
-	var direct LLMResponse
-	if err := json.Unmarshal([]byte(stdout), &direct); err == nil && (direct.Done || direct.Title != "") {
-		return &direct, nil
+	// 2) Strip ```json ... ``` if present (anywhere in the text).
+	if i := strings.Index(stdout, "```"); i >= 0 {
+		rest := stdout[i+3:]
+		// Allow either ```json\n or just ```\n.
+		rest = strings.TrimPrefix(rest, "json")
+		rest = strings.TrimPrefix(rest, "JSON")
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if end := strings.Index(rest, "```"); end > 0 {
+			candidate := strings.TrimSpace(rest[:end])
+			if r, err := tryDecode(candidate); err == nil {
+				return r, nil
+			}
+		}
 	}
 
+	// 1) Try direct decode.
+	if r, err := tryDecode(stdout); err == nil {
+		return r, nil
+	}
+
+	// 3) Take the largest {...} span.
 	first := strings.Index(stdout, "{")
 	last := strings.LastIndex(stdout, "}")
 	if first >= 0 && last > first {
-		blob := stdout[first : last+1]
-		// envelope { "result": ... } where result is the payload (object or stringified JSON).
-		var envelope struct {
-			Result json.RawMessage `json:"result"`
-		}
-		if err := json.Unmarshal([]byte(blob), &envelope); err == nil && len(envelope.Result) > 0 {
-			var inner LLMResponse
-			if err := json.Unmarshal(envelope.Result, &inner); err == nil && (inner.Done || inner.Title != "") {
-				return &inner, nil
-			}
-			var unquoted string
-			if err := json.Unmarshal(envelope.Result, &unquoted); err == nil {
-				if err := json.Unmarshal([]byte(unquoted), &inner); err == nil && (inner.Done || inner.Title != "") {
-					return &inner, nil
-				}
-			}
-		}
-		if err := json.Unmarshal([]byte(blob), &direct); err == nil && (direct.Done || direct.Title != "") {
-			return &direct, nil
+		if r, err := tryDecode(stdout[first : last+1]); err == nil {
+			return r, nil
 		}
 	}
 	return nil, fmt.Errorf("no decodable JSON in stdout")
+}
+
+func tryDecode(s string) (*LLMResponse, error) {
+	var r LLMResponse
+	if err := json.Unmarshal([]byte(s), &r); err != nil {
+		return nil, err
+	}
+	if !r.Done && r.Title == "" {
+		return nil, fmt.Errorf("decoded but empty (no done, no title)")
+	}
+	return &r, nil
 }
 
 func truncate(s string, n int) string {
