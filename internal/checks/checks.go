@@ -56,12 +56,13 @@ type Acceptance struct {
 
 // FeatureReport is what Feature writes to .slate/checks/feature.json.
 type FeatureReport struct {
-	StartedAt   string    `json:"startedAt"`
-	FinishedAt  string    `json:"finishedAt"`
-	Pass        bool      `json:"pass"`
-	Steps       []StepRes `json:"steps"`
-	BuildLog    string    `json:"buildLog,omitempty"`
-	LaunchError string    `json:"launchError,omitempty"`
+	StartedAt      string    `json:"startedAt"`
+	FinishedAt     string    `json:"finishedAt"`
+	Pass           bool      `json:"pass"`
+	Steps          []StepRes `json:"steps"`
+	BuildLog       string    `json:"buildLog,omitempty"`
+	LaunchError    string    `json:"launchError,omitempty"`
+	ScreenshotPath string    `json:"screenshotPath,omitempty"` // repo-relative path, e.g. "screenshots/S1-attempt-0.png"
 }
 
 // StepRes is the per-step outcome.
@@ -84,6 +85,8 @@ func Feature(args []string) error {
 	fs := flag.NewFlagSet("feature", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to .agent/config.yaml")
 	probesPath := fs.String("probes", "", "JSON file with acceptance probes")
+	issueNum := fs.Int("issue", 0, "issue number (used in screenshot filename)")
+	attempt := fs.Int("attempt", 0, "attempt number (used in screenshot filename)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -192,6 +195,14 @@ func Feature(args []string) error {
 	}
 	report.Pass = allOK
 	report.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// 3b. Screenshot — best-effort, never fails the check.
+	if path, err := captureScreenshot(baseURL, cwd, *issueNum, *attempt); err != nil {
+		ui.Warn("screenshot: %v", err)
+	} else if path != "" {
+		report.ScreenshotPath = path
+		ui.OK("screenshot saved → %s", path)
+	}
 
 	// 4. Graceful shutdown.
 	_ = postJSON(baseURL+pathOr(cfg.FeatureShutdownEndpoint, "/shutdown"), nil, 2*time.Second)
@@ -349,6 +360,46 @@ func deepEqualJSON(a, b any) bool {
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
 	return string(ab) == string(bb)
+}
+
+// captureScreenshot fetches GET /screenshot and writes the PNG body to
+// screenshots/S<issue>-attempt-<attempt>.png under cwd. Returns the
+// repo-relative path on success. Empty path on quiet success-without-issue
+// (e.g. issue=0 meaning the orchestrator didn't pin a number, so we
+// fall back to a timestamped name).
+func captureScreenshot(baseURL, cwd string, issue, attempt int) (string, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(baseURL + "/screenshot")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("/screenshot returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if len(body) < 8 || string(body[:8]) != "\x89PNG\r\n\x1a\n" {
+		return "", fmt.Errorf("/screenshot did not return PNG (got %d bytes, leading: %q)", len(body), truncate(string(body), 80))
+	}
+
+	dir := filepath.Join(cwd, "screenshots")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	var name string
+	if issue > 0 {
+		name = fmt.Sprintf("S%d-attempt-%d.png", issue, attempt)
+	} else {
+		name = fmt.Sprintf("ad-hoc-%d.png", time.Now().Unix())
+	}
+	full := filepath.Join(dir, name)
+	if err := os.WriteFile(full, body, 0o644); err != nil {
+		return "", err
+	}
+	return filepath.Join("screenshots", name), nil
 }
 
 func postJSON(url string, body []byte, timeout time.Duration) error {

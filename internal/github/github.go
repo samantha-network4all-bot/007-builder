@@ -35,6 +35,16 @@ func (i Issue) HasLabel(name string) bool {
 	return false
 }
 
+// RepoRawURL builds a raw.githubusercontent.com URL for a file at a
+// branch in the given repo. Used for embedding committed screenshots
+// in issue comments.
+func RepoRawURL(repo, branch, path string) string {
+	if branch == "" {
+		branch = "main"
+	}
+	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repo, branch, path)
+}
+
 // EnsureLabel creates a repo label if it doesn't exist. Errors (including
 // "label already exists") are swallowed — callers treat this as
 // best-effort.

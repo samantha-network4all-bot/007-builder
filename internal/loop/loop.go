@@ -4,6 +4,7 @@
 package loop
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -305,12 +306,36 @@ func Work(args []string) error {
 	}
 
 	// Code agent committed something. Run feature check.
-	if err := runFeatureCheck(cwd, cfg, acceptance); err != nil {
+	featureErr := runFeatureCheck(cwd, cfg, acceptance, issue.Number, attempt)
+
+	// Screenshot is captured by the feature check regardless of pass/fail.
+	// Commit and embed it in the issue comment so progress is visible
+	// on github.com without leaving the issue page.
+	shotPath := readScreenshotPath(cwd, cfg)
+	verdict := "pass"
+	summary := "feature check green"
+	if featureErr != nil {
+		verdict = "fail"
+		summary = truncate(featureErr.Error(), 2000)
+	}
+	if shotPath != "" {
+		if err := commitAndPushScreenshot(cwd, shotPath, issue.Number, attempt, verdict); err != nil {
+			ui.Warn("screenshot commit: %v", err)
+		} else {
+			rawURL := github.RepoRawURL(cfg.ProjectRepo, "main", shotPath)
+			body := fmt.Sprintf("## Attempt %d — %s\n\n![Slate after attempt %d](%s)\n\n%s",
+				attempt, verdict, attempt, rawURL, summary)
+			if err := github.CommentIssue(issue.Number, body); err != nil {
+				ui.Warn("comment issue: %v", err)
+			} else {
+				ui.OK("posted screenshot comment to #%d", issue.Number)
+			}
+		}
+	}
+
+	if featureErr != nil {
 		newAttempt := attempt + 1
 		_ = github.SetAttemptLabel(issue.Number, cfg.AttemptLabelPrefix, newAttempt)
-		comment := fmt.Sprintf("Attempt %d failed at feature check:\n```\n%s\n```",
-			newAttempt, truncate(err.Error(), 4000))
-		_ = github.CommentIssue(issue.Number, comment)
 		if newAttempt >= cfg.AttemptsPerIssue {
 			return github.HandoffForReview(issue.Number, cfg.HITLLabel,
 				fmt.Sprintf("feature check failed after %d attempts", newAttempt))
@@ -427,10 +452,9 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
-func runFeatureCheck(cwd string, cfg *config.Config, acceptanceJSON string) error {
+func runFeatureCheck(cwd string, cfg *config.Config, acceptanceJSON string, issueNum, attempt int) error {
 	// Write the acceptance JSON to a temp file and invoke checks.Feature
-	// via the builder binary itself — easier than re-importing checks here
-	// and avoiding the import cycle (loop → plan → ...). Use os.Args[0].
+	// via the builder binary itself — easier than re-importing checks here.
 	tmp, err := os.CreateTemp("", "probes-*.json")
 	if err != nil {
 		return err
@@ -446,7 +470,11 @@ func runFeatureCheck(cwd string, cfg *config.Config, acceptanceJSON string) erro
 	if err != nil {
 		return err
 	}
-	r, err := sh.Run(cwd, exe, "check", "feature", "--probes", tmp.Name())
+	r, err := sh.Run(cwd, exe, "check", "feature",
+		"--probes", tmp.Name(),
+		"--issue", fmt.Sprintf("%d", issueNum),
+		"--attempt", fmt.Sprintf("%d", attempt),
+	)
 	if err != nil {
 		return err
 	}
@@ -454,5 +482,55 @@ func runFeatureCheck(cwd string, cfg *config.Config, acceptanceJSON string) erro
 		return fmt.Errorf("check feature exit=%d\n%s", r.ExitCode, r.Combined())
 	}
 	fmt.Print(r.Stdout)
+	return nil
+}
+
+// readScreenshotPath pulls the ScreenshotPath field out of the most
+// recent feature.json report. Returns "" if missing.
+func readScreenshotPath(cwd string, cfg *config.Config) string {
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = ".slate"
+	}
+	b, err := os.ReadFile(filepath.Join(cwd, stateDir, "checks", "feature.json"))
+	if err != nil {
+		return ""
+	}
+	var report struct {
+		ScreenshotPath string `json:"screenshotPath"`
+	}
+	if err := json.Unmarshal(b, &report); err != nil {
+		return ""
+	}
+	return report.ScreenshotPath
+}
+
+// commitAndPushScreenshot stages, commits, and pushes a single PNG.
+// Uses --allow-empty so a duplicate (unchanged) PNG doesn't fail the
+// commit step.
+func commitAndPushScreenshot(cwd, relPath string, issue, attempt int, verdict string) error {
+	add, err := sh.Run(cwd, "git", "add", relPath)
+	if err != nil {
+		return err
+	}
+	if add.ExitCode != 0 {
+		return fmt.Errorf("git add %s: %s", relPath, add.Combined())
+	}
+	msg := fmt.Sprintf("screenshots: S%d attempt %d (%s)", issue, attempt, verdict)
+	commit, err := sh.Run(cwd, "git", "commit", "-m", msg)
+	if err != nil {
+		return err
+	}
+	// "nothing to commit" is fine — same screenshot from a re-run.
+	if commit.ExitCode != 0 && !strings.Contains(commit.Combined(), "nothing to commit") {
+		return fmt.Errorf("git commit: %s", commit.Combined())
+	}
+	push, err := sh.Run(cwd, "git", "push", "origin", "main")
+	if err != nil {
+		return err
+	}
+	if push.ExitCode != 0 {
+		return fmt.Errorf("git push: %s", push.Combined())
+	}
 	return nil
 }
