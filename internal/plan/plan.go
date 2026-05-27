@@ -91,17 +91,20 @@ func NextIssue(args []string) error {
 	}
 	defer os.Remove(tmpPrompt)
 
-	// pi --mode json emits an event stream (JSONL of session/turn/message
-	// events), not a single JSON document. We use the default text mode
-	// and parse the model's prose for the embedded JSON block.
+	// Run in --mode json so we can stream pi's event stream and show
+	// live progress (tool calls, deltas, char counter). The sink also
+	// reassembles the final assistant text from text_delta events.
+	sink := llm.NewEventSink(false)
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
 		Model:            cfg.LLMModel,
 		Thinking:         cfg.LLMThinking,
+		Mode:             "json",
 		SystemPromptFile: tmpPrompt,
 		UserMessage:      "Choose the next slice. Output strict JSON only — no surrounding prose, no markdown fences.",
 		Tools:            "read,grep,find,ls",
 		WorkingDir:       cwd,
+		Stream:           sink,
 	}
 	res, err := llm.Run(inv)
 	if err != nil {
@@ -111,9 +114,12 @@ func NextIssue(args []string) error {
 		return fmt.Errorf("planner outcome=%s exit=%d\nstderr:\n%s", res.Outcome, res.ExitCode, truncate(res.Stderr, 2000))
 	}
 
-	resp, err := decodeLLMJSON(res.Stdout)
+	// The assistant's final text is in the sink (not in res.Stdout —
+	// that contains the raw event stream).
+	assistant := sink.AssistantText()
+	resp, err := decodeLLMJSON(assistant)
 	if err != nil {
-		return fmt.Errorf("parse planner JSON: %w\nstdout was:\n%s", err, truncate(res.Stdout, 2000))
+		return fmt.Errorf("parse planner JSON: %w\nassistant text was:\n%s", err, truncate(assistant, 2000))
 	}
 
 	if resp.Done {

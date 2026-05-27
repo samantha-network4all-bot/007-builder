@@ -263,17 +263,22 @@ func Work(args []string) error {
 
 	ui.Step("invoking code agent (%s %s)", cfg.LLMCLI, cfg.LLMModel)
 	// Invoke the code agent.
+	// Streaming sink renders pi's live events (tool calls + char counter)
+	// so the user sees progress instead of waiting in silence for what
+	// can be 5-10 minutes of agent work.
+	sink := llm.NewEventSink(false)
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
 		Model:            cfg.LLMModel,
 		Thinking:         cfg.LLMThinking,
-		Mode:             "text",
+		Mode:             "json",
 		SystemPromptFile: tmpPrompt,
 		UserMessage: fmt.Sprintf("Implement issue #%d. Commit on main and push when done.",
 			issue.Number),
 		Tools:       cfg.LLMTools,
 		WorkingDir:  cwd,
 		TrackCommit: true,
+		Stream:      sink,
 	}
 	res, err := llm.Run(inv)
 	if err != nil {

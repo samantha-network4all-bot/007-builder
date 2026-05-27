@@ -52,6 +52,12 @@ type Invocation struct {
 	Thinking         string // --thinking level
 	WorkingDir       string // cwd of subprocess
 	TrackCommit      bool   // record HEAD before/after; if unchanged on exit 0 → Noop
+
+	// Stream, when non-nil, switches Run to live stdout pumping. Each
+	// stdout line is fed to Stream.Handle as it arrives — useful when
+	// pi runs in --mode json and emits structured events the caller
+	// wants to render in real time.
+	Stream *EventSink
 }
 
 // Result is what Run returns alongside the categorised outcome.
@@ -102,7 +108,15 @@ func Run(inv Invocation) (Result, error) {
 
 	res := Result{CommandLine: cli + " " + strings.Join(args, " ")}
 
-	r, err := sh.Run(inv.WorkingDir, cli, args...)
+	var (
+		r   sh.Result
+		err error
+	)
+	if inv.Stream != nil {
+		r, err = sh.Stream(inv.WorkingDir, cli, args, inv.Stream.Handle, nil)
+	} else {
+		r, err = sh.Run(inv.WorkingDir, cli, args...)
+	}
 	if err != nil {
 		res.Outcome = OutcomeUnknown
 		return res, err

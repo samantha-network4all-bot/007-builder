@@ -4,11 +4,14 @@
 package sh
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // Result is the structured outcome of one process invocation.
@@ -56,6 +59,77 @@ func Run(dir, name string, args ...string) (Result, error) {
 	}
 	// process-did-not-run failure
 	return res, fmt.Errorf("exec %s: %w", full, err)
+}
+
+// Stream is like Run but pipes stdout and stderr line-by-line to the
+// given callbacks AS they arrive (no buffering of the whole output
+// before returning). Useful for long-running LLM invocations where the
+// user wants to watch progress instead of waiting in silence.
+//
+// Stream also accumulates the full output into Result.Stdout/.Stderr,
+// so callers that want both live + retained output get it for free.
+//
+// Lines are split on \n. A trailing line without a newline is also
+// delivered. Buffer is sized for pi's JSON event lines (which can be
+// dozens of KB when they carry deltas).
+func Stream(dir, name string, args []string, onStdout, onStderr func(string)) (Result, error) {
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	full := name + " " + strings.Join(args, " ")
+	res := Result{Cmd: full}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return res, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return res, fmt.Errorf("stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return res, fmt.Errorf("start %s: %w", full, err)
+	}
+
+	var (
+		stdoutBuf, stderrBuf bytes.Buffer
+		wg                   sync.WaitGroup
+	)
+	wg.Add(2)
+	go pump(&wg, stdoutPipe, &stdoutBuf, onStdout)
+	go pump(&wg, stderrPipe, &stderrBuf, onStderr)
+	wg.Wait()
+
+	err = cmd.Wait()
+	res.Stdout = stdoutBuf.String()
+	res.Stderr = stderrBuf.String()
+	if err == nil {
+		res.ExitCode = 0
+		return res, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		res.ExitCode = ee.ExitCode()
+		return res, nil
+	}
+	return res, fmt.Errorf("exec %s: %w", full, err)
+}
+
+// pump scans a pipe line-by-line, tees to the buffer, and invokes the
+// per-line callback. Tolerates very long lines (pi event JSON can be 64K+).
+func pump(wg *sync.WaitGroup, r io.Reader, buf *bytes.Buffer, onLine func(string)) {
+	defer wg.Done()
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		buf.WriteString(line)
+		buf.WriteByte('\n')
+		if onLine != nil {
+			onLine(line)
+		}
+	}
 }
 
 // MustRun is Run that treats non-zero exit as a returned error. Use
