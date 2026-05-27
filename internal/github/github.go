@@ -35,6 +35,26 @@ func (i Issue) HasLabel(name string) bool {
 	return false
 }
 
+// EnsureLabel creates a repo label if it doesn't exist. Errors (including
+// "label already exists") are swallowed — callers treat this as
+// best-effort.
+func EnsureLabel(name string) {
+	if name == "" {
+		return
+	}
+	color := "ededed"
+	desc := ""
+	switch {
+	case strings.HasPrefix(name, "attempt:"):
+		color, desc = "ededed", "code-agent attempt counter"
+	case name == "slice":
+		color, desc = "0e8a16", "iterative build slice"
+	case strings.Contains(name, "review"):
+		color, desc = "d73a4a", "needs human review"
+	}
+	_, _ = sh.Run("", "gh", "label", "create", name, "--description", desc, "--color", color)
+}
+
 // RequireAuth verifies that `gh auth status` succeeds. Returns an error
 // otherwise, so Bootstrap can refuse to proceed without auth.
 func RequireAuth() error {
@@ -85,6 +105,7 @@ func ListSlices(label string) ([]Issue, error) {
 	if label == "" {
 		label = "slice"
 	}
+	EnsureLabel(label)
 	r, err := sh.MustRun("", "gh", "issue", "list",
 		"--label", label,
 		"--state", "all",
@@ -102,7 +123,12 @@ func ListSlices(label string) ([]Issue, error) {
 }
 
 // CreateIssue opens a new issue with the given labels. Returns its number.
+// Missing labels on the repo are created (idempotent — "already exists"
+// is ignored).
 func CreateIssue(title, body string, labels []string) (int, error) {
+	for _, l := range labels {
+		EnsureLabel(l)
+	}
 	args := []string{"issue", "create", "--title", title, "--body", body}
 	for _, l := range labels {
 		args = append(args, "--label", l)
@@ -211,6 +237,7 @@ func OldestOpenSlice(label string) (*Issue, error) {
 	if label == "" {
 		label = "slice"
 	}
+	EnsureLabel(label)
 	r, err := sh.MustRun("", "gh", "issue", "list",
 		"--label", label,
 		"--state", "open",
