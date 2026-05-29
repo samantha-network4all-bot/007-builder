@@ -266,33 +266,57 @@ func resolvePaths(root string, raw []string) []string {
 	return out
 }
 
+// Required names a config field that a caller insists must be set.
+// Using a typed enum (instead of magic strings) catches misspellings
+// at compile time — flagged by the thermo-nuclear sweep.
+type Required int
+
+const (
+	RequireProjectRepo Required = iota
+	RequireProjectName
+	RequirePRDPath
+	RequirePromptsDir
+	RequireFeatureBinary
+)
+
+func (r Required) String() string {
+	switch r {
+	case RequireProjectRepo:
+		return "project.repo"
+	case RequireProjectName:
+		return "project.name"
+	case RequirePRDPath:
+		return "paths.prd"
+	case RequirePromptsDir:
+		return "paths.prompts"
+	case RequireFeatureBinary:
+		return "feature_test.binary"
+	default:
+		return fmt.Sprintf("Required(%d)", int(r))
+	}
+}
+
 // Validate returns a non-nil error if any required field is missing.
 // Bootstrap requires fewer fields than Loop — the caller specifies
-// which subset matters.
-func (c *Config) Validate(required ...string) error {
+// which subset matters via the typed Required enum.
+func (c *Config) Validate(required ...Required) error {
 	missing := []string{}
 	for _, r := range required {
+		var ok bool
 		switch r {
-		case "project.repo":
-			if c.ProjectRepo == "" {
-				missing = append(missing, r)
-			}
-		case "project.name":
-			if c.ProjectName == "" {
-				missing = append(missing, r)
-			}
-		case "paths.prd":
-			if c.PRDPath == "" {
-				missing = append(missing, r)
-			}
-		case "paths.prompts":
-			if c.PromptsDir == "" {
-				missing = append(missing, r)
-			}
-		case "feature_test.binary":
-			if c.FeatureBinary == "" {
-				missing = append(missing, r)
-			}
+		case RequireProjectRepo:
+			ok = c.ProjectRepo != ""
+		case RequireProjectName:
+			ok = c.ProjectName != ""
+		case RequirePRDPath:
+			ok = c.PRDPath != ""
+		case RequirePromptsDir:
+			ok = c.PromptsDir != ""
+		case RequireFeatureBinary:
+			ok = c.FeatureBinary != ""
+		}
+		if !ok {
+			missing = append(missing, r.String())
 		}
 	}
 	if len(missing) > 0 {

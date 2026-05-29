@@ -97,12 +97,12 @@ func TestLoadFlat(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	c := &Config{Path: "x.yaml", ProjectName: "n"}
-	err := c.Validate("project.repo")
+	err := c.Validate(RequireProjectRepo)
 	if err == nil || !strings.Contains(err.Error(), "project.repo") {
 		t.Errorf("expected missing-field error, got %v", err)
 	}
 	c.ProjectRepo = "a/b"
-	if err := c.Validate("project.repo", "project.name"); err != nil {
+	if err := c.Validate(RequireProjectRepo, RequireProjectName); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

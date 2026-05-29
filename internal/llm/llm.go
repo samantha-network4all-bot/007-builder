@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+	"github.com/samantha-network4all-bot/007-builder/internal/stream"
 )
 
 // cavemanPrefix is prepended to UserMessage when Invocation.Caveman is
@@ -82,7 +83,7 @@ type Invocation struct {
 	// stdout line is fed to Stream.Handle as it arrives — useful when
 	// pi runs in --mode json and emits structured events the caller
 	// wants to render in real time.
-	Stream *EventSink
+	Stream *stream.EventSink
 }
 
 // Result is what Run returns alongside the categorised outcome.

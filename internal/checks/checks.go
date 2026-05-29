@@ -74,13 +74,122 @@ type StepRes struct {
 	ResponseTo string `json:"responseTo,omitempty"`
 }
 
-// Feature builds the project, launches the binary with the test-API env
-// var set, polls /healthz, then runs the acceptance probes.
-//
-//	builder check feature [--probes FILE]
-//
-// Without --probes, only /healthz is exercised (smoke test for the
-// seed scaffold).
+// FeatureOptions is the programmatic input to RunFeature — the same
+// fields that the CLI's --issue, --attempt, --probes flags carry.
+type FeatureOptions struct {
+	// Probes from the issue's acceptance block. Empty = healthz-only smoke.
+	Probes []Probe
+	// Issue + Attempt are used to name the screenshot file
+	// (screenshots/S<Issue>-attempt-<Attempt>.png).
+	Issue, Attempt int
+}
+
+// RunFeature is the programmatic entry point for the feature check.
+// The CLI wrapper Feature() parses flags, builds a FeatureOptions, and
+// delegates here. This split is what lets loop.Work invoke the check
+// in-process instead of shelling out to its own binary (thermo S5).
+func RunFeature(cwd string, cfg *config.Config, opts FeatureOptions) (*FeatureReport, error) {
+	if err := cfg.Validate(config.RequireProjectRepo, config.RequireFeatureBinary); err != nil {
+		return nil, err
+	}
+
+	ui.Header("feature check")
+	ui.Step("build (%d step%s)", len(cfg.FeatureBuild), plural(len(cfg.FeatureBuild)))
+	buildLog, err := runBuild(cwd, cfg.FeatureBuild)
+	writeBuildLog(cwd, cfg, buildLog)
+	if err != nil {
+		return nil, fmt.Errorf("build failed:\n%s", truncate(buildLog, 4000))
+	}
+
+	// 2. Launch.
+	binAbs := filepath.Join(cwd, cfg.FeatureBinary)
+	if _, err := os.Stat(binAbs); err != nil {
+		return nil, fmt.Errorf("binary missing after build: %s", binAbs)
+	}
+	envKV := strings.SplitN(cfg.FeatureEnableEnv, "=", 2)
+	if len(envKV) != 2 {
+		return nil, fmt.Errorf("feature_test.enable_env must be NAME=VALUE, got %q", cfg.FeatureEnableEnv)
+	}
+	_ = os.Remove(cfg.FeaturePortFile)
+
+	cmd := exec.Command(binAbs)
+	cmd.Env = append(os.Environ(), envKV[0]+"="+envKV[1])
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("launch %s: %w", binAbs, err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+			time.AfterFunc(2*time.Second, func() {
+				_ = cmd.Process.Kill()
+			})
+			_ = cmd.Wait()
+		}
+	}()
+
+	port, err := waitForPort(cfg.FeaturePortFile, time.Duration(maxInt(cfg.FeatureHealthzTimeoutS, 10))*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("port file %s did not appear: %v\nstderr:\n%s", cfg.FeaturePortFile, err, truncate(stderr.String(), 2000))
+	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	ui.OK("app up on %s", baseURL)
+
+	if err := waitForHealthz(baseURL+pathOr(cfg.FeatureHealthzEndpoint, "/healthz"), 5*time.Second); err != nil {
+		return nil, fmt.Errorf("/healthz never went green: %v\nstderr:\n%s", err, truncate(stderr.String(), 2000))
+	}
+
+	report := FeatureReport{
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		BuildLog:  truncate(buildLog, 8000),
+	}
+	allOK := true
+	for _, p := range opts.Probes {
+		for _, c := range p.Calls {
+			ok, status, detail, _ := callOne(baseURL, c)
+			report.Steps = append(report.Steps, StepRes{
+				Step:       p.Step,
+				OK:         ok,
+				Status:     status,
+				Detail:     detail,
+				ResponseTo: c.Method + " " + c.Path,
+			})
+			if ok {
+				ui.OK("%s %s", c.Method, c.Path)
+			} else {
+				ui.Fail("%s %s — %s", c.Method, c.Path, detail)
+				allOK = false
+			}
+		}
+	}
+	report.Pass = allOK
+	report.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// Screenshot — best-effort, never fails the check.
+	if path, err := captureScreenshot(baseURL, cwd, opts.Issue, opts.Attempt); err != nil {
+		ui.Warn("screenshot: %v", err)
+	} else if path != "" {
+		report.ScreenshotPath = path
+		ui.OK("screenshot saved → %s", path)
+	}
+
+	// Graceful shutdown.
+	_ = postJSON(baseURL+pathOr(cfg.FeatureShutdownEndpoint, "/shutdown"), nil, 2*time.Second)
+
+	if err := writeReport(cwd, cfg, &report); err != nil {
+		return &report, err
+	}
+	if !report.Pass {
+		return &report, fmt.Errorf("feature check failed")
+	}
+	ui.OK("feature check: PASS")
+	return &report, nil
+}
+
+// Feature is the CLI wrapper: parses --probes, --issue, --attempt,
+// --config, and calls RunFeature.
 func Feature(args []string) error {
 	fs := flag.NewFlagSet("feature", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to .agent/config.yaml")
@@ -103,61 +212,8 @@ func Feature(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.Validate("project.repo", "feature_test.binary"); err != nil {
-		return err
-	}
 
-	ui.Header("feature check")
-	ui.Step("build (%d step%s)", len(cfg.FeatureBuild), plural(len(cfg.FeatureBuild)))
-	// 1. Build.
-	buildLog, err := runBuild(cwd, cfg.FeatureBuild)
-	writeBuildLog(cwd, cfg, buildLog)
-	if err != nil {
-		return fmt.Errorf("build failed:\n%s", truncate(buildLog, 4000))
-	}
-
-	// 2. Launch.
-	binAbs := filepath.Join(cwd, cfg.FeatureBinary)
-	if _, err := os.Stat(binAbs); err != nil {
-		return fmt.Errorf("binary missing after build: %s", binAbs)
-	}
-	envKV := strings.SplitN(cfg.FeatureEnableEnv, "=", 2)
-	if len(envKV) != 2 {
-		return fmt.Errorf("feature_test.enable_env must be NAME=VALUE, got %q", cfg.FeatureEnableEnv)
-	}
-	_ = os.Remove(cfg.FeaturePortFile)
-
-	cmd := exec.Command(binAbs)
-	cmd.Env = append(os.Environ(), envKV[0]+"="+envKV[1])
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("launch %s: %w", binAbs, err)
-	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
-			time.AfterFunc(2*time.Second, func() {
-				_ = cmd.Process.Kill()
-			})
-			_ = cmd.Wait()
-		}
-	}()
-
-	port, err := waitForPort(cfg.FeaturePortFile, time.Duration(maxInt(cfg.FeatureHealthzTimeoutS, 10))*time.Second)
-	if err != nil {
-		return fmt.Errorf("port file %s did not appear: %v\nstderr:\n%s", cfg.FeaturePortFile, err, truncate(stderr.String(), 2000))
-	}
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	ui.OK("app up on %s", baseURL)
-
-	if err := waitForHealthz(baseURL+pathOr(cfg.FeatureHealthzEndpoint, "/healthz"), 5*time.Second); err != nil {
-		return fmt.Errorf("/healthz never went green: %v\nstderr:\n%s", err, truncate(stderr.String(), 2000))
-	}
-
-	// 3. Probes.
-	var probes []Probe
+	opts := FeatureOptions{Issue: *issueNum, Attempt: *attempt}
 	if *probesPath != "" {
 		b, err := os.ReadFile(*probesPath)
 		if err != nil {
@@ -167,54 +223,11 @@ func Feature(args []string) error {
 		if err := json.Unmarshal(b, &acc); err != nil {
 			return fmt.Errorf("parse probes file %s: %w", *probesPath, err)
 		}
-		probes = acc.Acceptance
+		opts.Probes = acc.Acceptance
 	}
 
-	report := FeatureReport{
-		StartedAt: time.Now().UTC().Format(time.RFC3339),
-		BuildLog:  truncate(buildLog, 8000),
-	}
-	allOK := true
-	for _, p := range probes {
-		for _, c := range p.Calls {
-			ok, status, detail, _ := callOne(baseURL, c)
-			report.Steps = append(report.Steps, StepRes{
-				Step:       p.Step,
-				OK:         ok,
-				Status:     status,
-				Detail:     detail,
-				ResponseTo: c.Method + " " + c.Path,
-			})
-			if ok {
-				ui.OK("%s %s", c.Method, c.Path)
-			} else {
-				ui.Fail("%s %s — %s", c.Method, c.Path, detail)
-				allOK = false
-			}
-		}
-	}
-	report.Pass = allOK
-	report.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-
-	// 3b. Screenshot — best-effort, never fails the check.
-	if path, err := captureScreenshot(baseURL, cwd, *issueNum, *attempt); err != nil {
-		ui.Warn("screenshot: %v", err)
-	} else if path != "" {
-		report.ScreenshotPath = path
-		ui.OK("screenshot saved → %s", path)
-	}
-
-	// 4. Graceful shutdown.
-	_ = postJSON(baseURL+pathOr(cfg.FeatureShutdownEndpoint, "/shutdown"), nil, 2*time.Second)
-
-	if err := writeReport(cwd, cfg, &report); err != nil {
-		return err
-	}
-	if !report.Pass {
-		return fmt.Errorf("feature check failed")
-	}
-	ui.OK("feature check: PASS")
-	return nil
+	_, err = RunFeature(cwd, cfg, opts)
+	return err
 }
 
 func runBuild(cwd string, steps []string) (string, error) {

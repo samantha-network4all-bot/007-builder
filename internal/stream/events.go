@@ -1,4 +1,12 @@
-package llm
+// Package stream renders pi's live event stream as colored, scrolling
+// terminal output. It is general-purpose subprocess-streaming
+// infrastructure — moved out of internal/llm because pi is the first
+// consumer but no longer the only conceivable one (a future build
+// monitor, log tailer, etc. could use the same sink).
+//
+// Consumers pass *EventSink as a callback target to long-running
+// processes (typically via internal/llm.Invocation.Stream).
+package stream
 
 import (
 	"encoding/json"

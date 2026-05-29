@@ -9,12 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/template"
 
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+	"github.com/samantha-network4all-bot/007-builder/internal/stream"
+	"github.com/samantha-network4all-bot/007-builder/internal/tmpl"
 	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
@@ -57,7 +58,7 @@ func NextIssue(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.Validate("project.repo", "paths.prd", "paths.prompts"); err != nil {
+	if err := cfg.Validate(config.RequireProjectRepo, config.RequirePRDPath, config.RequirePromptsDir); err != nil {
 		return err
 	}
 	ui.Step("planner: asking %s for the next slice", cfg.LLMModel)
@@ -77,16 +78,11 @@ func NextIssue(args []string) error {
 	files, _ := sh.Run(cwd, "git", "ls-files")
 
 	tmplPath := absInProject(cwd, filepath.Join(cfg.PromptsDir, "PROMPT-next-issue.tmpl"))
-	rendered, err := renderTemplate(tmplPath, map[string]any{
+	tmpPrompt, err := tmpl.RenderToTemp("builder-prompt-", tmplPath, map[string]any{
 		"PRD":        string(prdBytes),
 		"ClosedJSON": string(closedJSON),
 		"RepoFiles":  files.Stdout,
 	})
-	if err != nil {
-		return err
-	}
-
-	tmpPrompt, err := writeTempPrompt(rendered)
 	if err != nil {
 		return err
 	}
@@ -95,7 +91,7 @@ func NextIssue(args []string) error {
 	// Run in --mode json so we can stream pi's event stream and show
 	// live progress (tool calls, deltas, char counter). The sink also
 	// reassembles the final assistant text from text_delta events.
-	sink := llm.NewEventSink(false)
+	sink := stream.NewEventSink(false)
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
 		Model:            cfg.LLMModel,
@@ -172,35 +168,6 @@ func absInProject(cwd, p string) string {
 		return p
 	}
 	return filepath.Join(cwd, p)
-}
-
-func renderTemplate(path string, data any) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read template %s: %w", path, err)
-	}
-	t, err := template.New(filepath.Base(path)).Parse(string(b))
-	if err != nil {
-		return "", fmt.Errorf("parse template %s: %w", path, err)
-	}
-	var sb strings.Builder
-	if err := t.Execute(&sb, data); err != nil {
-		return "", fmt.Errorf("execute template %s: %w", path, err)
-	}
-	return sb.String(), nil
-}
-
-func writeTempPrompt(s string) (string, error) {
-	f, err := os.CreateTemp("", "builder-prompt-*.md")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(s); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
 }
 
 // decodeLLMJSON pulls the first decodable LLMResponse out of stdout.

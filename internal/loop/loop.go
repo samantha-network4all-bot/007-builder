@@ -10,15 +10,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/template"
 
+	"github.com/samantha-network4all-bot/007-builder/internal/checks"
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
 	"github.com/samantha-network4all-bot/007-builder/internal/plan"
+	"github.com/samantha-network4all-bot/007-builder/internal/repourl"
 	"github.com/samantha-network4all-bot/007-builder/internal/review"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
 	"github.com/samantha-network4all-bot/007-builder/internal/state"
+	"github.com/samantha-network4all-bot/007-builder/internal/stream"
+	"github.com/samantha-network4all-bot/007-builder/internal/tmpl"
 	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
@@ -55,7 +58,7 @@ func Bootstrap(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.Validate("project.repo", "project.name"); err != nil {
+	if err := cfg.Validate(config.RequireProjectRepo, config.RequireProjectName); err != nil {
 		return err
 	}
 
@@ -203,7 +206,7 @@ func Work(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.Validate("project.repo", "paths.prd", "paths.prompts", "feature_test.binary"); err != nil {
+	if err := cfg.Validate(config.RequireProjectRepo, config.RequirePRDPath, config.RequirePromptsDir, config.RequireFeatureBinary); err != nil {
 		return err
 	}
 
@@ -245,7 +248,7 @@ func Work(args []string) error {
 	// Render the code prompt.
 	tmplPath := filepath.Join(cwd, cfg.PromptsDir, "PROMPT-code.tmpl")
 	acceptance := extractAcceptanceBlock(issue.Body)
-	rendered, err := renderTemplate(tmplPath, map[string]any{
+	tmpPrompt, err := tmpl.RenderToTemp("builder-prompt-", tmplPath, map[string]any{
 		"IssueNumber":     issue.Number,
 		"IssueTitle":      issue.Title,
 		"IssueBody":       issue.Body,
@@ -255,16 +258,13 @@ func Work(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	tmpPrompt, err := writeTempPrompt(rendered)
-	if err != nil {
-		return err
-	}
 	defer os.Remove(tmpPrompt)
 
 	if *dryRun {
 		ui.Header("rendered code prompt")
-		fmt.Println(rendered)
+		if b, err := os.ReadFile(tmpPrompt); err == nil {
+			fmt.Println(string(b))
+		}
 		return nil
 	}
 
@@ -273,7 +273,7 @@ func Work(args []string) error {
 	// Streaming sink renders pi's live events (tool calls + char counter)
 	// so the user sees progress instead of waiting in silence for what
 	// can be 5-10 minutes of agent work.
-	sink := llm.NewEventSink(false)
+	sink := stream.NewEventSink(false)
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
 		Model:            cfg.LLMModel,
@@ -340,7 +340,7 @@ func Work(args []string) error {
 			ui.Warn("screenshot commit: %v", err)
 			imageLine = "_(screenshot captured but push failed: " + err.Error() + ")_"
 		} else {
-			rawURL := github.RepoRawURL(cfg.ProjectRepo, "main", shotPath)
+			rawURL := repourl.Raw(cfg.ProjectRepo, "main", shotPath)
 			imageLine = fmt.Sprintf("![Slate after attempt %d](%s)", attempt, rawURL)
 		}
 	}
@@ -533,35 +533,6 @@ func readPreviousFailure(cwd string, cfg *config.Config) string {
 	return string(b)
 }
 
-func renderTemplate(path string, data any) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read template %s: %w", path, err)
-	}
-	t, err := template.New(filepath.Base(path)).Parse(string(b))
-	if err != nil {
-		return "", fmt.Errorf("parse template %s: %w", path, err)
-	}
-	var sb strings.Builder
-	if err := t.Execute(&sb, data); err != nil {
-		return "", fmt.Errorf("execute template %s: %w", path, err)
-	}
-	return sb.String(), nil
-}
-
-func writeTempPrompt(s string) (string, error) {
-	f, err := os.CreateTemp("", "builder-prompt-*.md")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(s); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
-}
-
 // firstLabel returns the first label name on an issue, for log context.
 func firstLabel(i *github.Issue) string {
 	for _, l := range i.Labels {
@@ -584,37 +555,24 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
+// runFeatureCheck parses the issue's acceptance JSON and invokes
+// checks.RunFeature in-process. Previously this re-exec'd the builder
+// binary via os.Executable() — flagged by the thermo-nuclear sweep as
+// a gratuitous process hop. checks is a sibling package; we can call
+// it directly.
 func runFeatureCheck(cwd string, cfg *config.Config, acceptanceJSON string, issueNum, attempt int) error {
-	// Write the acceptance JSON to a temp file and invoke checks.Feature
-	// via the builder binary itself — easier than re-importing checks here.
-	tmp, err := os.CreateTemp("", "probes-*.json")
-	if err != nil {
-		return err
+	var acc checks.Acceptance
+	if strings.TrimSpace(acceptanceJSON) != "" {
+		if err := json.Unmarshal([]byte(acceptanceJSON), &acc); err != nil {
+			return fmt.Errorf("parse acceptance JSON: %w", err)
+		}
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(acceptanceJSON); err != nil {
-		tmp.Close()
-		return err
-	}
-	tmp.Close()
-
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	r, err := sh.Run(cwd, exe, "check", "feature",
-		"--probes", tmp.Name(),
-		"--issue", fmt.Sprintf("%d", issueNum),
-		"--attempt", fmt.Sprintf("%d", attempt),
-	)
-	if err != nil {
-		return err
-	}
-	if r.ExitCode != 0 {
-		return fmt.Errorf("check feature exit=%d\n%s", r.ExitCode, r.Combined())
-	}
-	fmt.Print(r.Stdout)
-	return nil
+	_, err := checks.RunFeature(cwd, cfg, checks.FeatureOptions{
+		Probes:  acc.Acceptance,
+		Issue:   issueNum,
+		Attempt: attempt,
+	})
+	return err
 }
 
 // readScreenshotPath pulls the ScreenshotPath field out of the most

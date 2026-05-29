@@ -14,12 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/template"
 
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
+	"github.com/samantha-network4all-bot/007-builder/internal/stream"
+	"github.com/samantha-network4all-bot/007-builder/internal/tmpl"
 	"github.com/samantha-network4all-bot/007-builder/internal/ui"
 )
 
@@ -71,7 +72,7 @@ func Run(cwd string, cfg *config.Config, baseSHA string, slicesInWindow []github
 	}
 
 	tmplPath := filepath.Join(cwd, cfg.PromptsDir, PromptFile)
-	rendered, err := renderTemplate(tmplPath, map[string]any{
+	tmpPrompt, err := tmpl.RenderToTemp("builder-thermo-", tmplPath, map[string]any{
 		"WindowSize":  len(slicesInWindow),
 		"BaseSHA":     baseSHA,
 		"DiffSummary": diff,
@@ -80,14 +81,9 @@ func Run(cwd string, cfg *config.Config, baseSHA string, slicesInWindow []github
 	if err != nil {
 		return 0, err
 	}
-
-	tmpPrompt, err := writeTempPrompt(rendered)
-	if err != nil {
-		return 0, err
-	}
 	defer os.Remove(tmpPrompt)
 
-	sink := llm.NewEventSink(false)
+	sink := stream.NewEventSink(false)
 	inv := llm.Invocation{
 		CLI:              cfg.LLMCLI,
 		Model:            cfg.LLMModel,
@@ -183,35 +179,6 @@ func capturedDiff(cwd, baseSHA string) (string, error) {
 	// the context.
 	body := r.Stdout + "\n\n" + truncate(full.Stdout, 200_000)
 	return body, nil
-}
-
-func renderTemplate(path string, data any) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
-	}
-	t, err := template.New(filepath.Base(path)).Parse(string(b))
-	if err != nil {
-		return "", err
-	}
-	var sb strings.Builder
-	if err := t.Execute(&sb, data); err != nil {
-		return "", err
-	}
-	return sb.String(), nil
-}
-
-func writeTempPrompt(s string) (string, error) {
-	f, err := os.CreateTemp("", "builder-thermo-*.md")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(s); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
 }
 
 // parseJSON extracts the LLMResponse from the assistant's text. Same
