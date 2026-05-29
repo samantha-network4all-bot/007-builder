@@ -274,8 +274,12 @@ func OldestOpenSlice(labels ...string) (*Issue, error) {
 }
 
 // HandoffForReview is the human-review escalation called at attempt cap.
-// Adds the HITL label, comments with a pointer to the latest failure,
-// and leaves the issue open for a human.
+// It adds the HITL label, comments with the latest failure, and then
+// CLOSES the issue so it leaves the open-slice queue. Leaving it open
+// wedged the loop: OldestOpenSlice kept re-selecting the capped issue
+// and Work re-escalated it every iteration forever. Closing matches the
+// documented orchestrator contract (PRD §9); a human finds escalations
+// via `is:closed label:<hitl>` and re-opens after addressing.
 func HandoffForReview(issue int, hitlLabel, reason string) error {
 	// Create the label idempotently.
 	_, _ = sh.Run("", "gh", "label", "create", hitlLabel,
@@ -284,6 +288,10 @@ func HandoffForReview(issue int, hitlLabel, reason string) error {
 	if _, err := sh.Run("", "gh", "issue", "edit", fmt.Sprintf("%d", issue), "--add-label", hitlLabel); err != nil {
 		return err
 	}
-	body := fmt.Sprintf("Hit attempt cap — escalating for human review.\n\nLast failure:\n```\n%s\n```", reason)
-	return CommentIssue(issue, body)
+	body := fmt.Sprintf("Hit attempt cap — escalating for human review and closing so the loop can proceed. Re-open after addressing.\n\nLast failure:\n```\n%s\n```", reason)
+	if err := CommentIssue(issue, body); err != nil {
+		return err
+	}
+	// Close without a second comment (the detail is in the comment above).
+	return CloseIssue(issue, "")
 }
