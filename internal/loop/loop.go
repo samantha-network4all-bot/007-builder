@@ -177,6 +177,17 @@ func initialCommitAndPush(dir, projectName string) error {
 // thermo-nuclear review. The counter resets on any failure.
 const ReviewWindowSize = 5
 
+// StallThreshold is how many times the same issue can produce the
+// same outcome before the orchestrator declares a loop-stall and
+// closes the issue as "already implemented" rather than cycling.
+const StallThreshold = 3
+
+// minNonEmptyDiffLines is the minimum number of changed lines (in
+// git diff --stat) for a code-agent run to be considered "did real
+// work". Below this the run is treated as a no-op (agent found
+// nothing to change) and the issue is a candidate for auto-close.
+const minNonEmptyDiffLines = 3
+
 // Work picks the oldest open slice issue, invokes the code agent,
 // runs the feature check, and either closes the issue (green) or
 // bumps attempt:N (red, with N<cap). At N==cap it labels for HITL
@@ -243,6 +254,13 @@ func Work(args []string) error {
 		ui.Warn("attempt cap already reached — escalating for HITL")
 		return github.HandoffForReview(issue.Number, cfg.HITLLabel,
 			"attempt cap reached before this run started")
+	}
+
+	// Stall detection: if this issue already produced the same
+	// outcome (attempt-1) times in a row, close it as "already
+	// implemented" instead of burning another iteration.
+	if err := checkLoopStall(cwd, cfg, issue.Number, attempt); err != nil {
+		return err
 	}
 
 	// Render the code prompt.
@@ -320,6 +338,22 @@ func Work(args []string) error {
 		return fmt.Errorf("code agent outcome=%s; bumped to attempt %d", res.Outcome, newAttempt)
 	}
 
+	// Diff-empty check: if the code agent touched almost nothing
+	// the issue is likely already implemented. Close it immediately
+	// and let the planner pick the next real slice.
+	if isDiff, empty := isDiffEmpty(cwd, cfg); isDiff && empty {
+		ui.Warn("code agent produced near-empty diff — issue already implemented, auto-closing")
+		_ = github.CommentIssue(issue.Number,
+			"Auto-closed by 007-builder: code agent produced no meaningful changes. Issue appears already implemented.")
+		if err := github.CloseIssue(issue.Number,
+			"Closed by 007-builder: diff empty, issue already implemented."); err != nil {
+			return err
+		}
+		resetGreenStreak(cwd, cfg)
+		resetLoopStall(cwd, cfg)
+		return nil
+	}
+
 	// Code agent committed something. Run feature check.
 	featureErr := runFeatureCheck(cwd, cfg, acceptance, issue.Number, attempt)
 
@@ -363,12 +397,21 @@ func Work(args []string) error {
 		return fmt.Errorf("feature check failed; bumped to attempt %d", newAttempt)
 	}
 
+	// Track outcome for stall detection. If the same issue keeps
+	// getting re-opened and passing, Count climbs toward threshold.
+	outcome := "pass"
+	if featureErr != nil {
+		outcome = "fail"
+	}
+	recordLoopOutcome(cwd, cfg, issue.Number, outcome)
+
 	// Green. Close the issue and update the consecutive-green streak.
 	if err := github.CloseIssue(issue.Number,
 		fmt.Sprintf("Closed by 007-builder. Commit %s passed the feature check.", abbrev(res.HEADAfter))); err != nil {
 		return err
 	}
 	ui.OK("closed issue #%d", issue.Number)
+	resetLoopStall(cwd, cfg)
 
 	// Only feature slices count toward the thermo window. Refactor
 	// slices opened by the review itself don't trigger another review.
@@ -498,8 +541,12 @@ func Run(args []string) error {
 		}
 
 		if err := Work(inner); err != nil {
-			ui.Fail("iter %d: work returned: %v", i, err)
-			// continue — failed iterations bump attempt; loop will pick it back up.
+			if strings.Contains(err.Error(), "__stall__") {
+				ui.Note("iter %d: %v — continuing to next issue", i, err)
+			} else {
+				ui.Fail("iter %d: work returned: %v", i, err)
+				// continue — failed iterations bump attempt; loop will pick it back up.
+			}
 		}
 	}
 }
@@ -623,4 +670,125 @@ func commitAndPushScreenshot(cwd, relPath string, issue, attempt int, verdict st
 		return fmt.Errorf("git push: %s", push.Combined())
 	}
 	return nil
+}
+
+// ─── Stall detection helpers ──────────────────────────────────────
+
+// isDiffEmpty returns (true, true) when the working tree has a
+// commit HEAD whose diff against HEAD~1 contains fewer than
+// minNonEmptyDiffLines changed lines. Returns (false, false) when
+// there is no prior commit to diff against (single-commit repo) or
+// when git diff fails — the caller should treat that as "not empty".
+func isDiffEmpty(cwd string, cfg *config.Config) (isDiff bool, empty bool) {
+	// Check we have at least 2 commits.
+	r, err := sh.Run(cwd, "git", "rev-list", "--count", "HEAD")
+	if err != nil || r.ExitCode != 0 {
+		return false, false
+	}
+	var count int
+	if _, err := fmt.Sscanf(strings.TrimSpace(r.Stdout), "%d", &count); err != nil || count < 2 {
+		return false, false
+	}
+
+	isDiff = true
+	r, err = sh.Run(cwd, "git", "diff", "--stat", "HEAD~1", "HEAD")
+	if err != nil || r.ExitCode != 0 {
+		return isDiff, false
+	}
+	stat := strings.TrimSpace(r.Stdout)
+	if stat == "" {
+		return isDiff, true
+	}
+	// Count changed lines by summing the last field of each
+	// "file | N +-" line. Quick heuristic: count '+'-only tokens.
+	// Even simpler: count the number of lines that mention
+	// insertions/deletions.
+	lines := strings.Split(stat, "\n")
+	changed := 0
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		// Format: "path/to/file | 5 +++--" or "5 files changed, 10 insertions(+), 2 deletions(-)"
+		if strings.Contains(l, "insertion") || strings.Contains(l, "deletion") {
+			// summary line — parse the numbers
+			for _, field := range strings.Split(l, ",") {
+				field = strings.TrimSpace(field)
+				var n int
+				if _, err := fmt.Sscanf(field, "%d", &n); err == nil {
+					changed += n
+				}
+			}
+			continue
+		}
+		// per-file line: extract the change count before the +-
+		if idx := strings.Index(l, "|"); idx >= 0 {
+			right := strings.TrimSpace(l[idx+1:])
+			var n int
+			if _, err := fmt.Sscanf(right, "%d", &n); err == nil {
+				changed += n
+			}
+		}
+	}
+	return isDiff, changed < minNonEmptyDiffLines
+}
+
+// checkLoopStall reads the LoopStall from state and checks whether
+// the current (issue, attempt) would exceed the threshold. If so it
+// auto-closes the issue and returns an error that stops Work.
+func checkLoopStall(cwd string, cfg *config.Config, issueNum, attempt int) error {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	// No prior stall record or different issue — not stalled yet.
+	if st.LoopStall.IssueNumber != issueNum {
+		return nil
+	}
+	if st.LoopStall.Count >= StallThreshold {
+		ui.Warn("loop stall detected: issue #%d produced outcome %q %d times — auto-closing",
+			issueNum, st.LoopStall.Outcome, st.LoopStall.Count)
+		_ = github.CommentIssue(issueNum,
+			fmt.Sprintf("Auto-closed by 007-builder: loop-stall detected.\n\n"+
+				"This issue was auto-closed after producing the same outcome (%s) %d times in a row.\n"+
+				"If this is incorrect, re-open and re-label.",
+				st.LoopStall.Outcome, st.LoopStall.Count))
+		if err := github.CloseIssue(issueNum,
+			fmt.Sprintf("Closed by 007-builder: loop-stall (outcome=%s x%d)",
+				st.LoopStall.Outcome, st.LoopStall.Count)); err != nil {
+			return err
+		}
+		resetGreenStreak(cwd, cfg)
+		resetLoopStall(cwd, cfg)
+		// Return a non-error sentinel so the loop continues to the next
+		// issue instead of halting the whole Run iteration.
+		return fmt.Errorf("__stall__ issue #%d auto-closed (outcome=%s x%d)",
+			issueNum, st.LoopStall.Outcome, st.LoopStall.Count)
+	}
+	return nil
+}
+
+// recordLoopOutcome updates the LoopStall tracker in state. If the
+// same issue produces the same outcome as the last run, Count
+// increments. Otherwise the tracker resets to (issue, outcome, 1).
+func recordLoopOutcome(cwd string, cfg *config.Config, issueNum int, outcome string) {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	if st.LoopStall.IssueNumber == issueNum && st.LoopStall.Outcome == outcome {
+		st.LoopStall.Count++
+	} else {
+		st.LoopStall = state.LoopStall{IssueNumber: issueNum, Outcome: outcome, Count: 1}
+	}
+	_ = state.Save(filepath.Join(cwd, cfg.StateDir), st)
+	if st.LoopStall.Count > 1 {
+		ui.Note("loop stall counter: issue #%d outcome=%q count=%d/%d",
+			issueNum, outcome, st.LoopStall.Count, StallThreshold)
+	}
+}
+
+// resetLoopStall clears the stall tracker in state.
+func resetLoopStall(cwd string, cfg *config.Config) {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	if st.LoopStall.Count == 0 && st.LoopStall.IssueNumber == 0 {
+		return
+	}
+	st.LoopStall = state.LoopStall{}
+	_ = state.Save(filepath.Join(cwd, cfg.StateDir), st)
 }

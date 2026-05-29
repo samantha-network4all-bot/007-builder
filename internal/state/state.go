@@ -11,6 +11,15 @@ import (
 	"time"
 )
 
+// LoopStall tracks consecutive identical (issue, outcome) pairs.
+// When StallCount reaches the threshold the orchestrator treats the
+// issue as self-replicating and closes it rather than looping.
+type LoopStall struct {	
+	IssueNumber int    `json:"issueNumber,omitempty"`
+	Outcome     string `json:"outcome,omitempty"`
+	Count       int    `json:"count,omitempty"`
+}
+
 // State is the JSON document persisted between subcommand runs.
 type State struct {
 	UpdatedAt    string `json:"updatedAt"`
@@ -20,6 +29,12 @@ type State struct {
 	LastOutcome  string `json:"lastOutcome,omitempty"` // llm.Outcome.String() or "feature-test-failed" etc.
 	LastCommit   string `json:"lastCommit,omitempty"`
 	LastError    string `json:"lastError,omitempty"`
+
+	// LoopStall detects self-replicating issue cycles. When the same
+	// issue number produces the same outcome Count times in a row the
+	// orchestrator closes the issue as "already implemented" instead
+	// of cycling further.
+	LoopStall LoopStall `json:"loopStall,omitempty"`
 
 	// ConsecutiveGreen counts successfully-closed feature slices since
 	// the last reset (failure OR thermo-nuclear review). When it hits

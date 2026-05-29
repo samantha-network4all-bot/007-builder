@@ -73,15 +73,28 @@ func NextIssue(args []string) error {
 	if err != nil {
 		return fmt.Errorf("list closed slices: %w", err)
 	}
-	closedJSON, _ := json.MarshalIndent(filterClosed(closed), "", "  ")
+	closedFiltered := filterClosed(closed)
+	closedJSON, _ := json.MarshalIndent(closedFiltered, "", "  ")
+
+	// Build a set of closed issue titles for duplicate detection.
+	closedTitles := make([]string, 0, len(closedFiltered))
+	closedTitleSet := make(map[string]bool, len(closedFiltered))
+	for _, c := range closedFiltered {
+		t := strings.ToLower(strings.TrimSpace(c.Title))
+		if t != "" {
+			closedTitles = append(closedTitles, c.Title)
+			closedTitleSet[t] = true
+		}
+	}
 
 	files, _ := sh.Run(cwd, "git", "ls-files")
 
 	tmplPath := absInProject(cwd, filepath.Join(cfg.PromptsDir, "PROMPT-next-issue.tmpl"))
 	tmpPrompt, err := tmpl.RenderToTemp("builder-prompt-", tmplPath, map[string]any{
-		"PRD":        string(prdBytes),
-		"ClosedJSON": string(closedJSON),
-		"RepoFiles":  files.Stdout,
+		"PRD":          string(prdBytes),
+		"ClosedJSON":   string(closedJSON),
+		"RepoFiles":    files.Stdout,
+		"ClosedTitles": closedTitles,
 	})
 	if err != nil {
 		return err
@@ -128,6 +141,23 @@ func NextIssue(args []string) error {
 	}
 	if resp.Title == "" || resp.Body == "" {
 		return fmt.Errorf("planner returned no title or body: %#v", resp)
+	}
+
+	// Duplicate-title guard: if the planner re-proposed a slice
+	// whose title matches a closed issue, reject it and ask again.
+	proposed := strings.ToLower(strings.TrimSpace(resp.Title))
+	if closedTitleSet[proposed] {
+		ui.Warn("planner re-proposed closed issue %q — rejecting", resp.Title)
+		return fmt.Errorf("planner returned duplicate of closed issue: %q", resp.Title)
+	}
+	// Fuzzy match: check if the proposed title is a substring of (or
+	// contains) any closed title — catches "S1: App scaffolding" vs
+	// "S1: App scaffolding — empty borderedless window".
+	for closedTitle := range closedTitleSet {
+		if strings.Contains(proposed, closedTitle) || strings.Contains(closedTitle, proposed) {
+			ui.Warn("planner proposed near-duplicate of closed issue %q → rejecting", resp.Title)
+			return fmt.Errorf("planner returned near-duplicate of closed issue: %q ≈ %q", resp.Title, closedTitle)
+		}
 	}
 
 	labels := resp.Labels
