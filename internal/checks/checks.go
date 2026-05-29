@@ -349,24 +349,91 @@ func callOne(base string, c Call) (ok bool, status int, detail string, body []by
 		return true, status, "", body
 	}
 
-	var got map[string]any
+	var got any
 	if err := json.Unmarshal(body, &got); err != nil {
 		return false, status, "response not JSON: " + err.Error() + " body=" + truncate(string(body), 200), body
 	}
-	var want map[string]any
+	var want any
 	if err := json.Unmarshal(c.Expect, &want); err != nil {
 		return false, status, "expect not JSON: " + err.Error(), body
 	}
-	for k, v := range want {
-		gv, ok := got[k]
-		if !ok {
-			return false, status, fmt.Sprintf("missing key %q in response", k), body
-		}
-		if !deepEqualJSON(gv, v) {
-			return false, status, fmt.Sprintf("key %q: got %v want %v", k, gv, v), body
-		}
+	if ok, msg := matchPartial(want, got); !ok {
+		return false, status, msg, body
 	}
 	return true, status, "", body
+}
+
+// matchPartial reports whether `want` is a partial match of `got`:
+//   - objects: every key in want must be present in got and match
+//     recursively (got may have extra keys);
+//   - arrays:  every element in want must match SOME element in got
+//     (order-independent containment), so `[{"id":"w1"}]` asserts "a
+//     window with id w1 exists" regardless of window ordering;
+//   - scalars: must be deeply equal.
+//
+// This replaces the old object-only matcher, which crashed on array
+// responses like GET /window/list.
+func matchPartial(want, got any) (bool, string) {
+	switch w := want.(type) {
+	case map[string]any:
+		g, ok := got.(map[string]any)
+		if !ok {
+			return false, fmt.Sprintf("expected object, got %s", jsonKind(got))
+		}
+		for k, wv := range w {
+			gv, ok := g[k]
+			if !ok {
+				return false, fmt.Sprintf("missing key %q in response", k)
+			}
+			if ok, msg := matchPartial(wv, gv); !ok {
+				return false, fmt.Sprintf("key %q: %s", k, msg)
+			}
+		}
+		return true, ""
+	case []any:
+		g, ok := got.([]any)
+		if !ok {
+			return false, fmt.Sprintf("expected array, got %s", jsonKind(got))
+		}
+		for i, wv := range w {
+			found := false
+			for _, gv := range g {
+				if matched, _ := matchPartial(wv, gv); matched {
+					found = true
+					break
+				}
+			}
+			if !found {
+				wb, _ := json.Marshal(wv)
+				return false, fmt.Sprintf("no array element matches want[%d]=%s", i, truncate(string(wb), 120))
+			}
+		}
+		return true, ""
+	default:
+		if !deepEqualJSON(want, got) {
+			return false, fmt.Sprintf("got %v want %v", got, want)
+		}
+		return true, ""
+	}
+}
+
+func jsonKind(v any) string {
+	switch v.(type) {
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "bool"
+	case nil:
+		return "null"
+	default:
+		return "unknown"
+	}
 }
 
 func deepEqualJSON(a, b any) bool {
