@@ -16,6 +16,7 @@ import (
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
 	"github.com/samantha-network4all-bot/007-builder/internal/plan"
+	"github.com/samantha-network4all-bot/007-builder/internal/review"
 	"github.com/samantha-network4all-bot/007-builder/internal/sh"
 	"github.com/samantha-network4all-bot/007-builder/internal/state"
 	"github.com/samantha-network4all-bot/007-builder/internal/ui"
@@ -169,6 +170,10 @@ func initialCommitAndPush(dir, projectName string) error {
 	return nil
 }
 
+// ReviewWindowSize is how many consecutive green slices trigger a
+// thermo-nuclear review. The counter resets on any failure.
+const ReviewWindowSize = 5
+
 // Work picks the oldest open slice issue, invokes the code agent,
 // runs the feature check, and either closes the issue (green) or
 // bumps attempt:N (red, with N<cap). At N==cap it labels for HITL
@@ -215,7 +220,8 @@ func Work(args []string) error {
 			return err
 		}
 	} else {
-		issue, err = github.OldestOpenSlice(cfg.SliceLabel)
+		// refactor:thermonuclear issues come first; then slice.
+		issue, err = github.OldestOpenSlice(review.RefactorLabel, cfg.SliceLabel)
 		if err != nil {
 			return err
 		}
@@ -280,6 +286,7 @@ func Work(args []string) error {
 		WorkingDir:  cwd,
 		TrackCommit: true,
 		Caveman:     *caveman || cfg.LLMCaveman,
+		Skills:      cfg.ResolveCodeSkills(cwd),
 		Stream:      sink,
 	}
 	res, err := llm.Run(inv)
@@ -300,7 +307,7 @@ func Work(args []string) error {
 	_ = state.Save(filepath.Join(cwd, cfg.StateDir), st)
 
 	if res.Outcome != llm.OutcomeSucceeded {
-		// Bump attempt and record context.
+		resetGreenStreak(cwd, cfg)
 		newAttempt := attempt + 1
 		_ = github.SetAttemptLabel(issue.Number, cfg.AttemptLabelPrefix, newAttempt)
 		comment := fmt.Sprintf("Attempt %d failed at code phase (outcome=%s).\n\nstderr:\n```\n%s\n```",
@@ -346,6 +353,7 @@ func Work(args []string) error {
 	}
 
 	if featureErr != nil {
+		resetGreenStreak(cwd, cfg)
 		newAttempt := attempt + 1
 		_ = github.SetAttemptLabel(issue.Number, cfg.AttemptLabelPrefix, newAttempt)
 		if newAttempt >= cfg.AttemptsPerIssue {
@@ -355,13 +363,88 @@ func Work(args []string) error {
 		return fmt.Errorf("feature check failed; bumped to attempt %d", newAttempt)
 	}
 
-	// Green. Close the issue.
+	// Green. Close the issue and update the consecutive-green streak.
 	if err := github.CloseIssue(issue.Number,
 		fmt.Sprintf("Closed by 007-builder. Commit %s passed the feature check.", abbrev(res.HEADAfter))); err != nil {
 		return err
 	}
 	ui.OK("closed issue #%d", issue.Number)
+
+	// Only feature slices count toward the thermo window. Refactor
+	// slices opened by the review itself don't trigger another review.
+	if issue.HasLabel(cfg.SliceLabel) {
+		bumpGreenStreak(cwd, cfg, issue.Number, issue.Title, res.HEADAfter)
+		maybeFireThermoReview(cwd, cfg)
+	}
 	return nil
+}
+
+// bumpGreenStreak loads state, increments ConsecutiveGreen, appends
+// this slice to ReviewWindowSlices, and saves. ReviewWindowBaseSHA is
+// captured at the start of a fresh streak (when counter goes 0 → 1).
+func bumpGreenStreak(cwd string, cfg *config.Config, num int, title, headSHA string) {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	if st.ConsecutiveGreen == 0 {
+		// Start of a new window — the base is the commit BEFORE the
+		// just-closed slice's commit chain. Cheapest correct answer:
+		// resolve HEAD~1 right now (head of repo after this slice's
+		// commits, minus one).
+		if base, ok := resolveHEADParent(cwd, headSHA); ok {
+			st.ReviewWindowBaseSHA = base
+		}
+		st.ReviewWindowSlices = nil
+	}
+	st.ConsecutiveGreen++
+	st.ReviewWindowSlices = append(st.ReviewWindowSlices, state.ClosedSlice{Number: num, Title: title})
+	_ = state.Save(filepath.Join(cwd, cfg.StateDir), st)
+	ui.Note("consecutive green slices: %d/%d", st.ConsecutiveGreen, ReviewWindowSize)
+}
+
+func resetGreenStreak(cwd string, cfg *config.Config) {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	if st.ConsecutiveGreen == 0 && st.ReviewWindowBaseSHA == "" {
+		return // already clean
+	}
+	st.ConsecutiveGreen = 0
+	st.ReviewWindowBaseSHA = ""
+	st.ReviewWindowSlices = nil
+	_ = state.Save(filepath.Join(cwd, cfg.StateDir), st)
+}
+
+// maybeFireThermoReview triggers review.Run when the counter hits the
+// window size. On any review outcome (clean OR blockers opened) the
+// counter resets to 0 — the window is closed.
+func maybeFireThermoReview(cwd string, cfg *config.Config) {
+	st, _ := state.Load(filepath.Join(cwd, cfg.StateDir))
+	if st.ConsecutiveGreen < ReviewWindowSize {
+		return
+	}
+	// Convert state slices to github.Issue shape the reviewer expects.
+	slices := make([]github.Issue, 0, len(st.ReviewWindowSlices))
+	for _, s := range st.ReviewWindowSlices {
+		slices = append(slices, github.Issue{Number: s.Number, Title: s.Title})
+	}
+	opened, err := review.Run(cwd, cfg, st.ReviewWindowBaseSHA, slices)
+	if err != nil {
+		ui.Warn("thermo review failed: %v", err)
+	} else if opened > 0 {
+		ui.Warn("thermo opened %d refactor issue(s); loop will pick them up first", opened)
+	}
+	// Whatever happened, the window closes.
+	resetGreenStreak(cwd, cfg)
+}
+
+// resolveHEADParent returns the parent commit of sha. Empty + false on
+// failure (e.g. initial commit has no parent).
+func resolveHEADParent(cwd, sha string) (string, bool) {
+	if sha == "" {
+		sha = "HEAD"
+	}
+	r, err := sh.Run(cwd, "git", "rev-parse", sha+"^")
+	if err != nil || r.ExitCode != 0 {
+		return "", false
+	}
+	return strings.TrimSpace(r.Stdout), true
 }
 
 // Run repeats next-issue + work until next-issue says "PRD complete"
@@ -400,17 +483,18 @@ func Run(args []string) error {
 		// Only open a new issue when nothing's open. Otherwise keep
 		// hammering the current oldest open slice until it closes or
 		// hits the attempt cap.
-		open, err := github.OldestOpenSlice(cfg.SliceLabel)
+		// Refactor:thermonuclear issues queue ahead of feature slices.
+		open, err := github.OldestOpenSlice(review.RefactorLabel, cfg.SliceLabel)
 		if err != nil {
-			return fmt.Errorf("iter %d: list open slices: %w", i, err)
+			return fmt.Errorf("iter %d: list open issues: %w", i, err)
 		}
 		if open == nil {
-			ui.Note("no open slice — asking planner for a new one")
+			ui.Note("no open slice or refactor issue — asking planner for a new one")
 			if err := plan.NextIssue(inner); err != nil {
 				return fmt.Errorf("iter %d: next-issue: %w", i, err)
 			}
 		} else {
-			ui.Note("continuing on open issue #%d", open.Number)
+			ui.Note("continuing on open issue #%d (%s)", open.Number, firstLabel(open))
 		}
 
 		if err := Work(inner); err != nil {
@@ -476,6 +560,14 @@ func writeTempPrompt(s string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// firstLabel returns the first label name on an issue, for log context.
+func firstLabel(i *github.Issue) string {
+	for _, l := range i.Labels {
+		return l.Name
+	}
+	return "unlabeled"
 }
 
 func abbrev(sha string) string {

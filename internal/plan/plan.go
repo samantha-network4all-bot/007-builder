@@ -106,6 +106,7 @@ func NextIssue(args []string) error {
 		Tools:            "read,grep,find,ls",
 		WorkingDir:       cwd,
 		Caveman:          *caveman || cfg.LLMCaveman,
+		Skills:           cfg.ResolveCodeSkills(cwd),
 		Stream:           sink,
 	}
 	res, err := llm.Run(inv)

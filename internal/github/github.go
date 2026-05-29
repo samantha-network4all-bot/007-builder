@@ -241,38 +241,46 @@ func CommentIssue(num int, body string) error {
 	return err
 }
 
-// OldestOpenSlice returns the oldest open slice-labelled issue, or
-// (nil, nil) if there are none.
-func OldestOpenSlice(label string) (*Issue, error) {
-	if label == "" {
-		label = "slice"
+// OldestOpenSlice returns the oldest open issue worth working on.
+// It tries label preferenceOrder in order — the first non-empty
+// result wins. This is how refactor:thermonuclear issues queue ahead
+// of feature slices.
+//
+// If `labels` is empty, defaults to ["refactor:thermonuclear", "slice"].
+func OldestOpenSlice(labels ...string) (*Issue, error) {
+	if len(labels) == 0 {
+		labels = []string{"refactor:thermonuclear", "slice"}
 	}
-	EnsureLabel(label)
-	r, err := sh.MustRun("", "gh", "issue", "list",
-		"--label", label,
-		"--state", "open",
-		"--json", "number,title,body,state,labels",
-		"--limit", "200",
-	)
-	if err != nil {
-		return nil, err
-	}
-	var issues []Issue
-	if err := json.Unmarshal([]byte(r.Stdout), &issues); err != nil {
-		return nil, fmt.Errorf("decode gh issue list: %w", err)
-	}
-	if len(issues) == 0 {
-		return nil, nil
-	}
-	// gh sorts newest-first; the oldest is the last entry. (Numbers are
-	// monotonic per repo, so picking the smallest number is also correct.)
-	oldest := &issues[0]
-	for i := range issues {
-		if issues[i].Number < oldest.Number {
-			oldest = &issues[i]
+	for _, lbl := range labels {
+		if lbl == "" {
+			continue
 		}
+		EnsureLabel(lbl)
+		r, err := sh.MustRun("", "gh", "issue", "list",
+			"--label", lbl,
+			"--state", "open",
+			"--json", "number,title,body,state,labels",
+			"--limit", "200",
+		)
+		if err != nil {
+			return nil, err
+		}
+		var issues []Issue
+		if err := json.Unmarshal([]byte(r.Stdout), &issues); err != nil {
+			return nil, fmt.Errorf("decode gh issue list: %w", err)
+		}
+		if len(issues) == 0 {
+			continue
+		}
+		oldest := &issues[0]
+		for i := range issues {
+			if issues[i].Number < oldest.Number {
+				oldest = &issues[i]
+			}
+		}
+		return oldest, nil
 	}
-	return oldest, nil
+	return nil, nil
 }
 
 // HandoffForReview is the human-review escalation called at attempt cap.

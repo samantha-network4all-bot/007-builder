@@ -13,13 +13,35 @@ import (
 
 // State is the JSON document persisted between subcommand runs.
 type State struct {
-	UpdatedAt    string  `json:"updatedAt"`
-	CurrentIssue int     `json:"currentIssue,omitempty"`
-	Attempt      int     `json:"attempt,omitempty"`
-	NextAction   string  `json:"nextAction,omitempty"`   // "code", "check", "abort", "done"
-	LastOutcome  string  `json:"lastOutcome,omitempty"`  // llm.Outcome.String() or "feature-test-failed" etc.
-	LastCommit   string  `json:"lastCommit,omitempty"`
-	LastError    string  `json:"lastError,omitempty"`
+	UpdatedAt    string `json:"updatedAt"`
+	CurrentIssue int    `json:"currentIssue,omitempty"`
+	Attempt      int    `json:"attempt,omitempty"`
+	NextAction   string `json:"nextAction,omitempty"`  // "code", "check", "abort", "done"
+	LastOutcome  string `json:"lastOutcome,omitempty"` // llm.Outcome.String() or "feature-test-failed" etc.
+	LastCommit   string `json:"lastCommit,omitempty"`
+	LastError    string `json:"lastError,omitempty"`
+
+	// ConsecutiveGreen counts successfully-closed feature slices since
+	// the last reset (failure OR thermo-nuclear review). When it hits
+	// the review window size (default 5) the orchestrator fires
+	// review.Run and resets to 0.
+	ConsecutiveGreen int `json:"consecutiveGreen,omitempty"`
+
+	// ReviewWindowBaseSHA is the commit immediately before the current
+	// window of green slices. Used as the base for `git diff base..HEAD`
+	// when the review fires. Updated to HEAD on every reset.
+	ReviewWindowBaseSHA string `json:"reviewWindowBaseSHA,omitempty"`
+
+	// ReviewWindowSlices accumulates the slice issue numbers + titles
+	// closed since the last review. Embedded in the thermo prompt so
+	// the model knows which slices it's reviewing.
+	ReviewWindowSlices []ClosedSlice `json:"reviewWindowSlices,omitempty"`
+}
+
+// ClosedSlice is a compact record of a successfully-closed slice.
+type ClosedSlice struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
 }
 
 // Load returns the persisted state from dir/state.json. A missing file

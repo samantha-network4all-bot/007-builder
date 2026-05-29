@@ -42,6 +42,12 @@ type Config struct {
 	LLMThinking string // llm.thinking ("off"|"minimal"|"low"|"medium"|"high"|"xhigh")
 	LLMCaveman  bool   // llm.caveman — terse-mode directive prepended to all prompts
 
+	// Skill files loaded via pi --skill <path>. CodeSkills are loaded on
+	// every code-writing turn; ReviewSkills on every code-quality /
+	// thermo-nuclear turn. Paths are relative to the project root.
+	CodeSkills   []string // skills.code:    [...]
+	ReviewSkills []string // skills.review:  [...]
+
 	// Loop.
 	AttemptsPerIssue   int    // loop.attempts_per_issue
 	HITLLabel          string // loop.hitl_label
@@ -214,8 +220,13 @@ func set(c *Config, section, key, value string) {
 }
 
 func setList(c *Config, section, key, value string) {
-	if section == "feature_test" && key == "build" {
+	switch section + "." + key {
+	case "feature_test.build":
 		c.FeatureBuild = append(c.FeatureBuild, value)
+	case "skills.code":
+		c.CodeSkills = append(c.CodeSkills, value)
+	case "skills.review":
+		c.ReviewSkills = append(c.ReviewSkills, value)
 	}
 }
 
@@ -227,6 +238,32 @@ func expandHome(p string) string {
 		}
 	}
 	return p
+}
+
+// ResolveCodeSkills returns absolute paths for CodeSkills, relative to
+// the given project root, dropping any entries that don't exist on
+// disk (pi --skill rejects nonexistent paths).
+func (c *Config) ResolveCodeSkills(projectRoot string) []string {
+	return resolvePaths(projectRoot, c.CodeSkills)
+}
+
+// ResolveReviewSkills is the same for ReviewSkills.
+func (c *Config) ResolveReviewSkills(projectRoot string) []string {
+	return resolvePaths(projectRoot, c.ReviewSkills)
+}
+
+func resolvePaths(root string, raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		full := p
+		if !filepath.IsAbs(full) {
+			full = filepath.Join(root, p)
+		}
+		if _, err := os.Stat(full); err == nil {
+			out = append(out, full)
+		}
+	}
+	return out
 }
 
 // Validate returns a non-nil error if any required field is missing.

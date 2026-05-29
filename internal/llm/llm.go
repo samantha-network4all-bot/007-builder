@@ -72,6 +72,12 @@ type Invocation struct {
 	// burn tokens and elapsed time without adding signal.
 	Caveman bool
 
+	// Skills is a list of skill file paths to load via pi --skill <path>.
+	// Each path becomes one --skill argument. Use this to inject
+	// architectural contracts (slate's MVC contract, thermo-nuclear
+	// review rules) without having to inline them in every prompt.
+	Skills []string
+
 	// Stream, when non-nil, switches Run to live stdout pumping. Each
 	// stdout line is fed to Stream.Handle as it arrives — useful when
 	// pi runs in --mode json and emits structured events the caller
@@ -116,6 +122,12 @@ func Run(inv Invocation) (Result, error) {
 	}
 	if inv.Tools != "" {
 		args = append(args, "--tools", inv.Tools)
+	}
+	for _, sk := range inv.Skills {
+		if sk == "" {
+			continue
+		}
+		args = append(args, "--skill", sk)
 	}
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
