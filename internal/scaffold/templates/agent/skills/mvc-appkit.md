@@ -154,22 +154,32 @@ protocol TestAPIControllerRoutes {
 
 ### Required endpoints per controller
 
+The infrastructure controllers are universal across projects:
+
 | Controller         | Prefix      | Min endpoints (PRD §7.3)                                  |
 |--------------------|-------------|-----------------------------------------------------------|
-| AppController      | `/app`      | `GET /healthz`, `POST /shutdown`                          |
-| WindowController   | `/window`   | `GET /list`, `GET /screenshot`                            |
-| EditorController   | `/editor`   | `GET /text`, `POST /type`, `GET /state`                   |
-| DocumentController | `/document` | `POST /openFile`, `POST /saveAs`                          |
+| AppController      | (top-level) | `GET /healthz`, `POST /shutdown`, `GET /screenshot`       |
+| WindowController   | `/window`   | `GET /list`                                               |
 | MenuController     | `/menu`     | `POST /invoke {path:[...]}`                               |
-| ShortcutController | `/shortcut` | `POST /press {keys:"cmd+s"}`                              |
+
+The `AppController` routes are **top-level** (no prefix) because the
+007-builder harness calls them at fixed paths: it polls `/healthz`,
+captures `/screenshot` after every attempt, and POSTs `/shutdown` to
+stop the app. Those three are the ONLY top-level routes permitted.
+
+Every other feature is its own controller with its own prefix — e.g. a
+text app might add `EditorController` (`/editor/text`, `/editor/type`),
+a drawing app a `CanvasController` (`/canvas/stroke`, `/canvas/pixel`).
+The PRD's §7.3 lists the concrete controllers for this project.
 
 A new feature MUST either:
 - belong to an existing controller (add a route under the existing
   prefix), OR
-- introduce a new controller with its own prefix + route file.
+- introduce a new controller with its own prefix.
 
-Never add a top-level route. The flat `/healthz` is the only one
-allowed (it lives on `AppController` with no prefix).
+Never add a top-level route other than the three orchestrator routes
+above (`/healthz`, `/shutdown`, `/screenshot`), which live on
+`AppController`.
 
 ---
 
@@ -181,14 +191,14 @@ __PROJECT_NAME__/
 ├── AppDelegate.swift                       # instantiates AppController
 │
 ├── App/
-│   ├── AppController.swift                 # /app/healthz, /app/shutdown
+│   ├── AppController.swift                 # /healthz, /shutdown, /screenshot (top-level)
 │   └── TestAPI/
 │       ├── TestAPIServer.swift             # HTTP listener
 │       ├── TestAPIRouter.swift             # flat registry
 │       └── TestAPIRequest+Response.swift   # value types
 │
 ├── Window/
-│   ├── WindowController.swift              # /window/list, /window/screenshot
+│   ├── WindowController.swift              # /window/list
 │   ├── WindowState.swift                   # model
 │   └── __PROJECT_NAME__Window.swift                   # NSWindow subclass
 │
@@ -227,9 +237,9 @@ The orchestrator's quality check will block the PR on any of:
    `TestAPIRouter`, or any TestAPI symbol. Views never speak API.
 3. A controller without a `routePrefix` if it has any user-visible
    behavior.
-4. A new top-level route (no controller prefix). Only `/healthz` is
-   exempt, and even that is on `AppController` for historical
-   reasons.
+4. A new top-level route (no controller prefix). Only the three
+   orchestrator routes `/healthz`, `/shutdown`, `/screenshot` are
+   exempt, and they live on `AppController`.
 5. A `MainViewController` / `HomeViewController` / catch-all
    controller. One controller per *coherent feature*; if it grows
    past ~200 lines, decompose.

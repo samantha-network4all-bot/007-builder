@@ -45,12 +45,15 @@ acceptance probes pass.
    template.
 4. **Never push to a branch other than `main`.** Branch creation
    is the orchestrator's job for HITL handoff only.
-5. **Test API parity (PRD §8.9).** If this issue adds a
-   user-visible feature, you MUST extend
-   `__PROJECT_NAME__/TestAPI/TestAPIRoutes.swift` so the feature is reachable
-   from HTTP. If you can't think of how a probe would reach the
-   feature, the issue is mis-specified — record that as the
-   failure reason and exit.
+5. **Test API parity + MVC (PRD §8.9 + §8.14).** If this issue adds a
+   user-visible feature, the owning `NSViewController` MUST register its
+   own routes (an extension conforming to `TestAPIControllerRoutes` in
+   the same file, namespaced `/<prefix>/<action>`) so the feature is
+   reachable from HTTP. Do NOT add routes to a shared routes file and do
+   NOT add top-level routes (only `/healthz`, `/shutdown`, `/screenshot`
+   are top-level). See `.agent/skills/mvc-appkit.md`. If you can't think
+   of how a probe would reach the feature, the issue is mis-specified —
+   record that as the failure reason and exit.
 6. **No `osascript`, `CGEvent`, `AXUIElement` in app code.** Those
    belong to the obsolete pre-__PROJECT_NAME__ harness. Verification flows
    exclusively through the HTTP test API.
@@ -74,8 +77,8 @@ acceptance probes pass.
    `__PROJECT_NAME__/<area>/`).
 4. Make the minimum change that:
    - implements the behavior described in the issue body, AND
-   - extends `__PROJECT_NAME__/TestAPI/TestAPIRoutes.swift` so every probe in
-     the acceptance block has a route that can satisfy it.
+   - registers the route(s) on the owning controller (per §8.14) so
+     every probe in the acceptance block has a route that satisfies it.
 5. Build: `xcodegen generate && xcodebuild -scheme __PROJECT_NAME__ -configuration Debug -derivedDataPath build/ build`.
    - If the build fails, fix the error in the same iteration. The
      feature-test check refuses to run a non-compiling tree.

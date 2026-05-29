@@ -26,34 +26,34 @@ approve.
   {{.IssueBody}}
   ```
 
-## Required checks (block on any failure)
+## How to review
 
-1. **PRD §8.1 — entry point**: `__PROJECT_NAME__/main.swift` exists and calls
-   `NSApplication.shared.run()`. No `@main` on AppDelegate.
-2. **PRD §8.2 — text view construction**: every new/modified
-   `NSTextView` is built via the four-stage chain (storage →
-   layout manager → container → text view). Search the diff for
-   `NSTextView(` and `NSTextContainer(`; if a container is
-   constructed without an attached layout manager, block.
-3. **PRD §8.3 — first responder**: any call to `makeFirstResponder`
-   passes a text view, not a scroll view.
-4. **PRD §8.4 — image loading**: no
-   `NSImage(imageLiteralResourceName:)` anywhere in the diff.
-5. **PRD §8.5 — callback re-entrancy**: any new "selectX" /
-   "navigateTo" / "set current path" method must not call back to
-   itself via the same notification/closure it would emit.
-6. **PRD §8.6 — borderless windows**: every new `NSWindow`
-   subclass with `.borderless` overrides `canBecomeKey` and
-   `canBecomeMain`.
-7. **PRD §8.7 — file panels**: no new custom file dialogs (use
-   `NSOpenPanel` / `NSSavePanel`).
-8. **PRD §8.8 — force-unwrap discipline**: scan for `try!`, `as!`,
-   and `!` on optionals; allow only the §8.8 whitelist.
-9. **PRD §8.9 — test API parity**: if the diff adds user-visible
-   behavior (a new menu item, a new shortcut, a new dialog),
-   confirm that `__PROJECT_NAME__/TestAPI/TestAPIRoutes.swift` was extended
-   to expose it.
-10. **PRD §8.10 — silent failure**: no empty `catch {}` blocks.
+**Read `PRD.md` §8 in full and block on any violation of any invariant
+listed there as written.** §8 is the project's own contract; its
+numbering and project-specific rules vary per project — enforce what the
+PRD actually says, not a memorised list.
+
+In addition, these **universal** invariants apply to every project of
+this kind and you must always enforce them:
+
+U1. **Entry point**: `__PROJECT_NAME__/main.swift` exists and calls
+    `NSApplication.shared.run()`; no `@main` on `NSApplicationDelegate`.
+U2. **Image loading**: no `NSImage(imageLiteralResourceName:)`.
+U3. **Force-unwrap discipline**: `try!`, `as!`, and `!`-on-optionals are
+    forbidden outside the PRD §8 whitelist.
+U4. **Test API parity + MVC**: any diff that adds user-visible behavior
+    extends the *owning* `NSViewController`'s routes (an extension in the
+    same file, namespaced `/<prefix>/<action>`). Block routes in a shared
+    routes file, models that `import AppKit`, or views that import
+    `TestAPIRouter`/`URLSession`. Block any top-level route other than
+    `/healthz`, `/shutdown`, `/screenshot`.
+U5. **Silent failure**: no empty `catch {}` blocks.
+U6. **Self-screenshot only**: `/screenshot` uses the in-process
+    `cacheDisplay` path; block any `CGWindowListCreateImage`,
+    `CGDisplayCreateImage`, `screencapture`, or TCC-gated API.
+
+Cite the PRD §8 number for project-specific blockers, or the `U#` tag
+for universal ones.
 
 ## Output format
 
@@ -63,8 +63,8 @@ Respond with a JSON object:
 {
   "verdict": "approve" | "request-changes",
   "blockers": [
-    {"rule": "8.2", "file": "__PROJECT_NAME__/Editor/EditorScrollView.swift", "line": 14,
-     "comment": "NSTextContainer constructed without layout manager attached..."}
+    {"rule": "U4", "file": "__PROJECT_NAME__/App/TestAPI/Routes.swift", "line": 14,
+     "comment": "route POST /foo/bar registered in a shared routes file; it must live on FooController per §8.14..."}
   ],
   "nits": [
     {"file": "...", "line": 0, "comment": "..."}
