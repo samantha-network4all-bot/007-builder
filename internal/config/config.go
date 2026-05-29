@@ -53,6 +53,7 @@ type Config struct {
 	HITLLabel          string // loop.hitl_label
 	SliceLabel         string // loop.slice_label
 	AttemptLabelPrefix string // loop.attempt_label_prefix
+	RefuseDirtyTree    bool   // loop.refuse_dirty_tree — if true, abort on a dirty tree instead of auto-resetting it (default: auto-reset)
 
 	// Feature test.
 	FeatureEnableEnv        string   // feature_test.enable_env
@@ -204,6 +205,8 @@ func set(c *Config, section, key, value string) {
 		c.SliceLabel = value
 	case "loop.attempt_label_prefix":
 		c.AttemptLabelPrefix = value
+	case "loop.refuse_dirty_tree":
+		c.RefuseDirtyTree = value == "true" || value == "1" || value == "yes"
 	case "feature_test.enable_env":
 		c.FeatureEnableEnv = value
 	case "feature_test.port_file":

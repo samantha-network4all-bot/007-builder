@@ -173,6 +173,37 @@ func initialCommitAndPush(dir, projectName string) error {
 	return nil
 }
 
+// ensureCleanTree makes the working tree clean so Work can start. A
+// dirty tree at this point is always detritus from an interrupted or
+// failed previous attempt (a code agent edited files but didn't commit,
+// e.g. because the build broke or it errored out). main is the source of
+// truth and the next attempt re-derives from the issue + PreviousFailure,
+// so by default we discard the leftover changes and proceed — otherwise
+// the loop re-detects the same dirty tree on every iteration and spins
+// forever. With loop.refuse_dirty_tree set, we instead return an error
+// (the old hard-stop). Safe to call on a clean tree (no-op).
+func ensureCleanTree(dir string, cfg *config.Config) error {
+	r, _ := sh.Run(dir, "git", "status", "--porcelain")
+	dirty := strings.TrimSpace(r.Stdout)
+	if dirty == "" {
+		return nil
+	}
+	if cfg.RefuseDirtyTree {
+		return fmt.Errorf("working tree is dirty; refusing to start work (loop.refuse_dirty_tree):\n%s", dirty)
+	}
+	ui.Warn("working tree dirty — discarding leftover changes from a prior run:\n%s", dirty)
+	if _, err := sh.MustRun(dir, "git", "reset", "--hard", "HEAD"); err != nil {
+		return fmt.Errorf("git reset --hard: %w", err)
+	}
+	// -d removes untracked dirs/files; ignored paths (build/, the state
+	// dir, *.xcodeproj) are preserved because we omit -x.
+	if _, err := sh.MustRun(dir, "git", "clean", "-fd"); err != nil {
+		return fmt.Errorf("git clean -fd: %w", err)
+	}
+	ui.OK("working tree reset to HEAD; continuing")
+	return nil
+}
+
 // ReviewWindowSize is how many consecutive green slices trigger a
 // thermo-nuclear review. The counter resets on any failure.
 const ReviewWindowSize = 5
@@ -221,9 +252,15 @@ func Work(args []string) error {
 		return err
 	}
 
-	// Refuse to start on a dirty tree.
-	if r, _ := sh.Run(cwd, "git", "status", "--porcelain"); strings.TrimSpace(r.Stdout) != "" {
-		return fmt.Errorf("working tree is dirty; refusing to start work:\n%s", r.Stdout)
+	// Recover from a dirty tree. Uncommitted changes here are always
+	// detritus from an interrupted or failed previous attempt — main is
+	// the source of truth, and the next attempt re-derives from the
+	// issue + PreviousFailure. So by default we discard them and proceed
+	// rather than wedging the loop (which otherwise re-detects the dirty
+	// tree every iteration forever). Set loop.refuse_dirty_tree: true to
+	// restore the old hard-stop.
+	if err := ensureCleanTree(cwd, cfg); err != nil {
+		return err
 	}
 
 	// Pick issue.
