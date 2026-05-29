@@ -7,18 +7,24 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
 	"github.com/samantha-network4all-bot/007-builder/internal/checks"
 	"github.com/samantha-network4all-bot/007-builder/internal/loop"
 	"github.com/samantha-network4all-bot/007-builder/internal/plan"
+	"github.com/samantha-network4all-bot/007-builder/internal/scaffold"
 )
 
 const usage = `builder <command> [args]
 
 Commands:
-  bootstrap                 Create the GitHub repo + seed commit (one-shot).
+  init                      Scaffold the project structure from PRD.md
+                            (.agent/, Project.yml, lessons, README) then
+                            create the GitHub repo + seed commit.
+  bootstrap                 (alias of init, kept for back-compat) create the
+                            repo + seed commit without re-scaffolding.
   next-issue                Ask the LLM for the next slice; open a GitHub issue.
   work                      Pick the oldest open slice issue and run one
                             code-agent + check cycle.
@@ -26,6 +32,13 @@ Commands:
   check quality <issue>     Run the code-quality LLM review on the issue's PR.
   check feature <issue>     Build the target project and run the issue's HTTP probes.
   version                   Print version.
+
+init flags:
+  --name NAME    project name (default: parsed from the PRD.md title)
+  --repo SLUG    GitHub owner/name (default: <gh-user>/<name>)
+  --force        overwrite existing scaffold files instead of skipping them
+  --no-bootstrap scaffold files only; skip repo creation + push
+  --dry-run      print what would be written/done without doing it
 
 Config: builder reads ./.agent/config.yaml from cwd. Override with --config=PATH.
 `
@@ -40,6 +53,8 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "init":
+		err = runInit(args)
 	case "bootstrap":
 		err = loop.Bootstrap(args)
 	case "next-issue":
@@ -63,4 +78,37 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runInit scaffolds the project structure from PRD.md (via the scaffold
+// package) and then, unless --no-bootstrap, hands off to loop.Bootstrap
+// to create the GitHub repo and push the seed commit.
+func runInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	name := fs.String("name", "", "project name (default: parsed from PRD.md title)")
+	repo := fs.String("repo", "", "GitHub owner/name (default: <gh-user>/<name>)")
+	force := fs.Bool("force", false, "overwrite existing scaffold files")
+	noBootstrap := fs.Bool("no-bootstrap", false, "scaffold files only; skip repo creation + push")
+	dryRun := fs.Bool("dry-run", false, "print actions without writing/doing")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if _, err := scaffold.Run(scaffold.Options{
+		Name:   *name,
+		Repo:   *repo,
+		Force:  *force,
+		DryRun: *dryRun,
+	}); err != nil {
+		return err
+	}
+
+	// In dry-run there is no config on disk for bootstrap to load, so
+	// stop after reporting the scaffold actions.
+	if *noBootstrap || *dryRun {
+		return nil
+	}
+
+	// Hand off to bootstrap, which reloads the freshly-written config.
+	return loop.Bootstrap(nil)
 }

@@ -1,0 +1,111 @@
+# __PROJECT_NAME__ — choose the next vertical slice
+
+You decide what to build next. Read the PRD and the list of
+already-completed slices, then propose ONE issue — the smallest
+user-visible vertical slice that advances the product.
+
+## Inputs
+
+- **PRD**: full text of `PRD.md` (below in
+  `<prd>...</prd>`).
+- **Closed slices**: JSON list of already-merged S-issues with
+  their titles, bodies, and acceptance probes (below in
+  `<closed>...</closed>`).
+- **Repo state**: output of `git ls-files __PROJECT_NAME__/` (the files that
+  currently exist) (below in `<files>...</files>`).
+
+```
+<prd>
+{{.PRD}}
+</prd>
+
+<closed>
+{{.ClosedJSON}}
+</closed>
+
+<files>
+{{.RepoFiles}}
+</files>
+```
+
+## Closed titles (DO NOT re-propose)
+
+The following issue titles are already closed. Do NOT return a slice
+whose title matches or is a near-duplicate of any of these. If the
+only reasonable next slice looks like one of these, return
+`{"done": true}` instead.
+
+```
+{{range .ClosedTitles}}- {{.}}
+{{end}}
+```
+
+## Rules for the next slice
+
+1. **Smallest possible vertical**. "Window appears" is one slice.
+   "Editor renders a caret" is another. "Editor accepts typed
+   characters" is a third. Do not bundle.
+2. **Must be reachable from HTTP**. The acceptance probes use
+   only the endpoints listed in PRD §7.3 — or, if the slice
+   *adds* an endpoint, that endpoint must be specified inline.
+3. **Must not violate §8 invariants**. If the only way to satisfy
+   the slice would require breaking an invariant, choose a
+   different slice.
+4. **No invented PRD content**. If the next reasonable behavior
+   isn't in the PRD, return `{"done": true}`.
+5. **Each issue gets exactly one DoD section** with concrete
+   HTTP probes — never "user can click and it feels right" and
+   never shell commands.
+
+## Acceptance schema (STRICT — the runner parses this)
+
+The `acceptance:` block embedded in the issue body MUST be exactly
+this shape:
+
+```json
+{
+  "acceptance": [
+    {
+      "step": "human-label-for-this-probe",
+      "calls": [
+        { "method": "GET",  "path": "/healthz", "expect": {"ok": true} },
+        { "method": "POST", "path": "/type",    "body":   {"text": "hello"} },
+        { "method": "GET",  "path": "/text",    "expect": {"text": "hello"} }
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+- `acceptance` is an array of objects.
+- Each object has a `step` string and a `calls` array
+  (always plural, even if length 1).
+- Each call has `method` (uppercase) and `path` (starts with `/`).
+- `body` is JSON; the runner posts it as `application/json`.
+- `expect` is JSON; the runner checks that every key in `expect`
+  appears in the response with an equal value (partial match).
+- Do **not** include `command:` or any shell step. Build / launch
+  / shutdown are handled by the orchestrator outside the
+  `acceptance` block.
+
+## Output
+
+Return strict JSON:
+
+```json
+{
+  "done": false,
+  "title": "Sn: <one-line title>",
+  "body": "## Why\n...\n\n## What\n...\n\n## Definition of done\n\n```json\n{\"acceptance\":[ ... ]}\n```\n",
+  "labels": ["slice", "attempt:0"]
+}
+```
+
+Or:
+
+```json
+{"done": true, "reason": "PRD §1-§6 fully covered by closed slices."}
+```
+
+The orchestrator parses the JSON; do not wrap it in prose.

@@ -1,0 +1,68 @@
+# Thermo-nuclear review — five-slice sweep
+
+You are reviewing the cumulative changes of the last
+{{.WindowSize}} green slices on the project. The
+thermo-nuclear-code-quality-review skill (loaded via --skill) is the
+review playbook; apply it strictly. Your goal is to find structural
+debt that has accumulated as slices stacked on top of each other —
+debt no single slice's quality check would have flagged.
+
+## Inputs
+
+- **PRD**: `PRD.md` — the architectural contract.
+- **Lessons learned**: `lessons-learned.md` — historical defects.
+- **Skill**: `thermo-nuclear-code-quality-review` (loaded). Use it.
+- **Diff under review** (last {{.WindowSize}} closed slices,
+  `git diff {{.BaseSHA}}..HEAD`):
+
+```
+{{.DiffSummary}}
+```
+
+- **Closed slices in this window**:
+{{range .Slices}}  - S{{.Number}}: {{.Title}}
+{{end}}
+
+## What to look for
+
+Follow the skill's checklist verbatim. In addition, for this project
+specifically, push hard on:
+
+- **MVC contract violations** (PRD §8.14, `.agent/skills/mvc-appkit.md`).
+  Routes outside their controller. Views touching `TestAPIRouter` or
+  `URLSession`. Models importing AppKit. Top-level routes.
+- **Catch-all controllers**. If a `*Controller.swift` is over 300
+  lines, it's probably absorbing logic that wants its own controller.
+- **Duplicated state.** Two controllers reading the same `var` from
+  a shared singleton are usually one missing protocol away from
+  cleaner ownership.
+- **`/screenshot` regressions**. PRD §8.13. Any reach for
+  CGWindowList / screencapture / Accessibility is a blocker.
+
+## Output format (STRICT)
+
+Strict JSON only. No prose, no markdown fences:
+
+```json
+{
+  "verdict": "approve" | "request-changes",
+  "blockers": [
+    {
+      "title": "refactor: <short slug, no S-prefix>",
+      "files": ["__PROJECT_NAME__/Editor/EditorController.swift"],
+      "category": "judo" | "spaghetti" | "size" | "boundary" | "duplication" | "magic",
+      "rationale": "two-to-five sentences. Name the structural problem. Name the restructuring you want. Be concrete: which method moves where, what protocol is missing, what file should be split."
+    }
+  ],
+  "nits": []
+}
+```
+
+Each blocker becomes one GitHub issue with label
+`refactor:thermonuclear`. The orchestrator picks those up *before*
+any further feature slice, so be precise about scope: a blocker
+that names 4 specific files and the move is much more actionable
+than one that says "the whole module is messy".
+
+If `verdict == "approve"` and `blockers` is empty, the loop returns
+to feature slices on the next iteration.
