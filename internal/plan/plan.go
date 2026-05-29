@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/samantha-network4all-bot/007-builder/internal/checks"
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
 	"github.com/samantha-network4all-bot/007-builder/internal/github"
 	"github.com/samantha-network4all-bot/007-builder/internal/llm"
@@ -101,85 +102,116 @@ func NextIssue(args []string) error {
 	}
 	defer os.Remove(tmpPrompt)
 
-	// Run in --mode json so we can stream pi's event stream and show
-	// live progress (tool calls, deltas, char counter). The sink also
-	// reassembles the final assistant text from text_delta events.
-	sink := stream.NewEventSink(false)
-	inv := llm.Invocation{
-		CLI:              cfg.LLMCLI,
-		Model:            cfg.LLMModel,
-		Thinking:         cfg.LLMThinking,
-		Mode:             "json",
-		SystemPromptFile: tmpPrompt,
-		UserMessage:      "Choose the next slice. Output strict JSON only — no surrounding prose, no markdown fences.",
-		Tools:            "read,grep,find,ls",
-		WorkingDir:       cwd,
-		Caveman:          *caveman || cfg.LLMCaveman,
-		Skills:           cfg.ResolveCodeSkills(cwd),
-		Stream:           sink,
-	}
-	res, err := llm.Run(inv)
-	sink.Finish()
-	if err != nil {
-		return fmt.Errorf("invoke LLM: %w", err)
-	}
-	if res.Outcome != llm.OutcomeSucceeded {
-		return fmt.Errorf("planner outcome=%s exit=%d\nstderr:\n%s", res.Outcome, res.ExitCode, truncate(res.Stderr, 2000))
-	}
-
-	// The assistant's final text is in the sink (not in res.Stdout —
-	// that contains the raw event stream).
-	assistant := sink.AssistantText()
-	resp, err := decodeLLMJSON(assistant)
-	if err != nil {
-		return fmt.Errorf("parse planner JSON: %w\nassistant text was:\n%s", err, truncate(assistant, 2000))
-	}
-
-	if resp.Done {
-		ui.OK("planner: PRD covered — %s", resp.Reason)
-		return nil
-	}
-	if resp.Title == "" || resp.Body == "" {
-		return fmt.Errorf("planner returned no title or body: %#v", resp)
-	}
-
-	// Duplicate-title guard: if the planner re-proposed a slice
-	// whose title matches a closed issue, reject it and ask again.
-	proposed := strings.ToLower(strings.TrimSpace(resp.Title))
-	if closedTitleSet[proposed] {
-		ui.Warn("planner re-proposed closed issue %q — rejecting", resp.Title)
-		return fmt.Errorf("planner returned duplicate of closed issue: %q", resp.Title)
-	}
-	// Fuzzy match: check if the proposed title is a substring of (or
-	// contains) any closed title — catches "S1: App scaffolding" vs
-	// "S1: App scaffolding — empty borderedless window".
-	for closedTitle := range closedTitleSet {
-		if strings.Contains(proposed, closedTitle) || strings.Contains(closedTitle, proposed) {
-			ui.Warn("planner proposed near-duplicate of closed issue %q → rejecting", resp.Title)
-			return fmt.Errorf("planner returned near-duplicate of closed issue: %q ≈ %q", resp.Title, closedTitle)
+	// Ask the planner, validate, and re-sample on a bad roll. The planner
+	// is an LLM and occasionally returns a duplicate slice or malformed
+	// acceptance JSON (e.g. mangled query strings like `?x=400&y":300`).
+	// Opening such an issue burns the entire attempt budget because the
+	// feature check can never parse the probes — exactly how S6 (Fill
+	// tool) hit the cap. Re-ask instead of opening a doomed issue.
+	const planTries = 3
+	var chosen *LLMResponse
+	var lastErr error
+	for try := 0; try < planTries; try++ {
+		// Run in --mode json so we can stream pi's event stream and show
+		// live progress; the sink reassembles the final assistant text.
+		sink := stream.NewEventSink(false)
+		inv := llm.Invocation{
+			CLI:              cfg.LLMCLI,
+			Model:            cfg.LLMModel,
+			Thinking:         cfg.LLMThinking,
+			Mode:             "json",
+			SystemPromptFile: tmpPrompt,
+			UserMessage:      "Choose the next slice. Output strict JSON only — no surrounding prose, no markdown fences.",
+			Tools:            "read,grep,find,ls",
+			WorkingDir:       cwd,
+			Caveman:          *caveman || cfg.LLMCaveman,
+			Skills:           cfg.ResolveCodeSkills(cwd),
+			Stream:           sink,
 		}
+		res, err := llm.Run(inv)
+		sink.Finish()
+		if err != nil {
+			lastErr = fmt.Errorf("invoke LLM: %w", err)
+			continue
+		}
+		if res.Outcome != llm.OutcomeSucceeded {
+			lastErr = fmt.Errorf("planner outcome=%s exit=%d", res.Outcome, res.ExitCode)
+			continue
+		}
+
+		// The assistant's final text is in the sink (not res.Stdout).
+		resp, err := decodeLLMJSON(sink.AssistantText())
+		if err != nil {
+			lastErr = fmt.Errorf("parse planner JSON: %w", err)
+			ui.Warn("planner JSON did not parse (try %d/%d) — re-asking", try+1, planTries)
+			continue
+		}
+		if resp.Done {
+			ui.OK("planner: PRD covered — %s", resp.Reason)
+			return nil
+		}
+		if resp.Title == "" || resp.Body == "" {
+			lastErr = fmt.Errorf("planner returned no title or body")
+			ui.Warn("planner returned no title/body (try %d/%d) — re-asking", try+1, planTries)
+			continue
+		}
+
+		// Duplicate-title guard (exact + fuzzy): re-ask on a hit.
+		proposed := strings.ToLower(strings.TrimSpace(resp.Title))
+		if closedTitleSet[proposed] {
+			lastErr = fmt.Errorf("duplicate of closed issue %q", resp.Title)
+			ui.Warn("planner re-proposed closed issue %q (try %d/%d) — re-asking", resp.Title, try+1, planTries)
+			continue
+		}
+		dup := false
+		for closedTitle := range closedTitleSet {
+			if strings.Contains(proposed, closedTitle) || strings.Contains(closedTitle, proposed) {
+				dup = true
+				lastErr = fmt.Errorf("near-duplicate of closed issue %q ≈ %q", resp.Title, closedTitle)
+				break
+			}
+		}
+		if dup {
+			ui.Warn("planner proposed near-duplicate %q (try %d/%d) — re-asking", resp.Title, try+1, planTries)
+			continue
+		}
+
+		// Acceptance-block guard: the issue MUST carry a parseable
+		// ```json acceptance block, or the feature check can never run
+		// and the slice is unwinnable.
+		if err := validateAcceptance(resp.Body); err != nil {
+			lastErr = err
+			ui.Warn("planner acceptance JSON invalid (try %d/%d): %v — re-asking", try+1, planTries, err)
+			continue
+		}
+
+		chosen = resp
+		break
+	}
+	if chosen == nil {
+		return fmt.Errorf("planner failed to produce a valid slice after %d tries: %w", planTries, lastErr)
 	}
 
-	labels := resp.Labels
+	labels := chosen.Labels
 	if len(labels) == 0 {
 		labels = []string{cfg.SliceLabel, cfg.AttemptLabelPrefix + "0"}
 	}
 
 	if *dryRun {
 		ui.Header("proposed issue (dry run)")
-		ui.KV("title", resp.Title)
+		ui.KV("title", chosen.Title)
 		ui.KV("labels", strings.Join(labels, ","))
 		fmt.Println()
-		fmt.Println(resp.Body)
+		fmt.Println(chosen.Body)
 		return nil
 	}
 
-	num, err := github.CreateIssue(resp.Title, resp.Body, labels)
+	num, err := github.CreateIssue(chosen.Title, chosen.Body, labels)
 	if err != nil {
 		return fmt.Errorf("create issue: %w", err)
 	}
 	ui.OK("opened issue")
-	ui.Issue(num, resp.Title)
+	ui.Issue(num, chosen.Title)
 	return nil
 }
 
@@ -258,4 +290,51 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…(truncated)"
+}
+
+// validateAcceptance confirms the issue body carries a parseable ```json
+// acceptance block with at least one well-formed probe. This is the
+// guard that would have stopped S6 (Fill tool) from being opened with
+// mangled query-string JSON and burning all 10 attempts: a slice whose
+// probes don't parse can never pass the feature check, so it must never
+// be opened.
+func validateAcceptance(body string) error {
+	block := extractAcceptanceBlock(body)
+	if strings.TrimSpace(block) == "" {
+		return fmt.Errorf("issue body has no ```json acceptance block")
+	}
+	var acc checks.Acceptance
+	if err := json.Unmarshal([]byte(block), &acc); err != nil {
+		return fmt.Errorf("acceptance JSON does not parse: %w", err)
+	}
+	if len(acc.Acceptance) == 0 {
+		return fmt.Errorf("acceptance block has no steps")
+	}
+	for i, step := range acc.Acceptance {
+		if len(step.Calls) == 0 {
+			return fmt.Errorf("acceptance step %d (%q) has no calls", i, step.Step)
+		}
+		for j, c := range step.Calls {
+			if c.Method == "" || !strings.HasPrefix(c.Path, "/") {
+				return fmt.Errorf("acceptance step %d call %d: bad method/path (%q %q)", i, j, c.Method, c.Path)
+			}
+		}
+	}
+	return nil
+}
+
+// extractAcceptanceBlock returns the contents of the first ```json fenced
+// block in the issue body (the acceptance probes), or "" if absent.
+func extractAcceptanceBlock(body string) string {
+	const fence = "```json"
+	start := strings.Index(body, fence)
+	if start < 0 {
+		return ""
+	}
+	rest := body[start+len(fence):]
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:end])
 }
