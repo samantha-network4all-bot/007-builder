@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -435,6 +436,14 @@ func matchPartial(want, got any) (bool, string) {
 		}
 		return true, ""
 	default:
+		if ws, ok := want.(string); ok {
+			gs, isStr := got.(string)
+			if isStr {
+				if matched, _ := regexp.MatchString(ws, gs); matched {
+					return true, ""
+				}
+			}
+		}
 		if !deepEqualJSON(want, got) {
 			return false, fmt.Sprintf("got %v want %v", got, want)
 		}
