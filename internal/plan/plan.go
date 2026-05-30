@@ -111,6 +111,7 @@ func NextIssue(args []string) error {
 	const planTries = 3
 	var chosen *LLMResponse
 	var lastErr error
+	var lastRaw string // raw assistant text of the most recent try, for troubleshooting
 	for try := 0; try < planTries; try++ {
 		// Run in --mode json so we can stream pi's event stream and show
 		// live progress; the sink reassembles the final assistant text.
@@ -140,7 +141,8 @@ func NextIssue(args []string) error {
 		}
 
 		// The assistant's final text is in the sink (not res.Stdout).
-		resp, err := decodeLLMJSON(sink.AssistantText())
+		lastRaw = sink.AssistantText()
+		resp, err := decodeLLMJSON(lastRaw)
 		if err != nil {
 			lastErr = fmt.Errorf("parse planner JSON: %w", err)
 			ui.Warn("planner JSON did not parse (try %d/%d) — re-asking", try+1, planTries)
@@ -189,6 +191,17 @@ func NextIssue(args []string) error {
 		break
 	}
 	if chosen == nil {
+		// Dump the exact text the planner returned on the final try so the
+		// real failure (truncated JSON, prose wrapping, an empty response,
+		// a refusal) is visible instead of just the parse error. This is a
+		// hard stop: the loop cannot proceed without a valid slice.
+		ui.Header("planner: last raw output (%d bytes) — could not produce a valid slice", len(lastRaw))
+		if strings.TrimSpace(lastRaw) == "" {
+			fmt.Println("<empty — the model returned no assistant text>")
+		} else {
+			fmt.Println(lastRaw)
+		}
+		fmt.Println()
 		return fmt.Errorf("planner failed to produce a valid slice after %d tries: %w", planTries, lastErr)
 	}
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/samantha-network4all-bot/007-builder/internal/config"
@@ -112,8 +113,23 @@ func RunFeature(cwd string, cfg *config.Config, opts FeatureOptions) (*FeatureRe
 	}
 	_ = os.Remove(cfg.FeaturePortFile)
 
+	// Reap any orphaned instance from a prior interrupted run before
+	// launching. A GUI AppKit app ignores SIGINT, so its only reliable
+	// kill is our SIGKILL fallback — which never fires if the harness
+	// itself died (Ctrl-C, panic, a hard step error) before the teardown
+	// defer ran. Those orphans accumulate and can hold singleton resources
+	// (lock files, the Application Support dir). pkill -f the binary by its
+	// absolute path so each check starts from a guaranteed-clean slate.
+	if r, _ := sh.Run("", "pkill", "-f", binAbs); r.ExitCode == 0 {
+		ui.Warn("reaped orphaned instance(s) of %s from a prior run", filepath.Base(binAbs))
+		time.Sleep(200 * time.Millisecond) // let the OS release the window/listener
+	}
+
 	cmd := exec.Command(binAbs)
 	cmd.Env = append(os.Environ(), envKV[0]+"="+envKV[1])
+	// Own process group so teardown can SIGKILL the whole tree (the app
+	// plus any helper/XPC children) in one shot, not just the parent PID.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -121,12 +137,21 @@ func RunFeature(cwd string, cfg *config.Config, opts FeatureOptions) (*FeatureRe
 		return nil, fmt.Errorf("launch %s: %w", binAbs, err)
 	}
 	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
-			time.AfterFunc(2*time.Second, func() {
-				_ = cmd.Process.Kill()
-			})
-			_ = cmd.Wait()
+		if cmd.Process == nil {
+			return
+		}
+		pid := cmd.Process.Pid
+		// Polite first: SIGTERM the group (the app's /shutdown POST above
+		// is the real graceful path; this is a backstop).
+		_ = syscall.Kill(-pid, syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			// Wedged — SIGKILL the whole group, then reap.
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			<-done
 		}
 	}()
 
